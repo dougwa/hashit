@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result};
+use console::{Key, Term};
 
 use crate::inventory::build_inventory;
 use crate::scan::{process_dir, scan, ScanOptions, DEDUP_SUFFIX};
@@ -75,6 +76,66 @@ fn pointer_path(removed: &Path) -> PathBuf {
 }
 
 fn prompt_choice(n: usize) -> Result<Choice> {
+    // Single-keypress input needs a real terminal on both ends; otherwise fall
+    // back to line input (handles pipes, redirects, and non-interactive stdin).
+    if io::stdin().is_terminal() && io::stdout().is_terminal() {
+        prompt_choice_key(n)
+    } else {
+        prompt_choice_line(n)
+    }
+}
+
+/// Read a choice one keypress at a time, no ENTER required. A digit is accepted
+/// the moment it can't be the prefix of a larger in-range index (e.g. with 8
+/// candidates "3" commits immediately; with 12 candidates "1" waits, since "10"
+/// is still reachable, and ENTER then commits the bare "1").
+fn prompt_choice_key(n: usize) -> Result<Choice> {
+    let term = Term::stdout();
+    loop {
+        term.write_str(&format!("Keep which? [1-{n}, (s)kip, (a)uto]: "))?;
+        let mut digits = String::new();
+        let choice = loop {
+            match term.read_key()? {
+                Key::Char('s' | 'S') if digits.is_empty() => break Some(Choice::Skip),
+                Key::Char('a' | 'A') if digits.is_empty() => break Some(Choice::Auto),
+                Key::Char(c @ '0'..='9') => {
+                    let v: usize = format!("{digits}{c}").parse().unwrap_or(usize::MAX);
+                    // Reject leading zero and anything already past the top index.
+                    if v == 0 || v > n {
+                        continue;
+                    }
+                    digits.push(c);
+                    term.write_str(&c.to_string())?;
+                    // No longer-reachable index has these digits as a prefix.
+                    if v.saturating_mul(10) > n {
+                        break Some(Choice::Keep(v - 1));
+                    }
+                }
+                Key::Backspace => {
+                    if digits.pop().is_some() {
+                        term.clear_chars(1)?;
+                    }
+                }
+                Key::Enter => {
+                    if let Ok(v) = digits.parse::<usize>() {
+                        if (1..=n).contains(&v) {
+                            break Some(Choice::Keep(v - 1));
+                        }
+                    }
+                    // Bare ENTER or out-of-range: ignore and keep reading.
+                }
+                _ => {}
+            }
+        };
+        term.write_line("")?;
+        if let Some(c) = choice {
+            return Ok(c);
+        }
+    }
+}
+
+/// Line-buffered fallback for non-interactive use.
+fn prompt_choice_line(n: usize) -> Result<Choice> {
     let mut input = String::new();
     loop {
         print!("Keep which? [1-{n}, (s)kip, (a)uto]: ");
