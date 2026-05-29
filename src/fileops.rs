@@ -23,6 +23,16 @@ struct State {
     cache: ManifestCache,
 }
 
+/// Directory that contains `p`. A bare relative name like `foo.DNG` has a
+/// `parent()` of `Some("")`, not `None`; treat that (and any parent-less path)
+/// as the current directory so scans and manifest updates hit the right dir.
+fn parent_dir(p: &Path) -> PathBuf {
+    match p.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
+}
+
 /// Scan each source first so its `.hashit` is current before the operation:
 /// directories are scanned recursively, individual files have their containing
 /// directory refreshed. Deduplicated so the same location isn't scanned twice.
@@ -35,11 +45,10 @@ fn scan_sources(sources: &[PathBuf], scan_opts: &ScanOptions) -> Result<()> {
                 scan(&root, scan_opts)?;
             }
         } else if src.is_file() {
-            if let Some(parent) = src.parent() {
-                let dir = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
-                if scanned.insert(dir.clone()) {
-                    process_dir(&dir, scan_opts, &dir)?;
-                }
+            let parent = parent_dir(src);
+            let dir = parent.canonicalize().unwrap_or(parent);
+            if scanned.insert(dir.clone()) {
+                process_dir(&dir, scan_opts, &dir)?;
             }
         }
     }
@@ -55,9 +64,9 @@ fn stage_from_source(src: &Path, target: &Path, st: &mut State) {
             e.size = md.len();
             e.mtime_ns = mtime_ns(&md);
         }
-        if let (Some(dir), Some(name)) = (target.parent(), target.file_name()) {
+        if let Some(name) = target.file_name() {
             st.staged
-                .entry(dir.to_path_buf())
+                .entry(parent_dir(target))
                 .or_default()
                 .push((name.to_string_lossy().to_string(), e));
         }
@@ -68,10 +77,9 @@ fn copy_file(src: &Path, target: &Path, opts: &OpOptions, st: &mut State) -> Res
     if target.exists() && !opts.force {
         bail!("{} already exists (use -f to overwrite)", target.display());
     }
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-        st.affected.insert(parent.to_path_buf());
-    }
+    let parent = parent_dir(target);
+    fs::create_dir_all(&parent).with_context(|| format!("creating {}", parent.display()))?;
+    st.affected.insert(parent);
     fs::copy(src, target)
         .with_context(|| format!("copying {} -> {}", src.display(), target.display()))?;
     stage_from_source(src, target, st);
@@ -185,9 +193,8 @@ fn move_one(src: &Path, target: &Path, opts: &OpOptions, st: &mut State) -> Resu
     // still has it even after a rename, but grabbing it now is simplest).
     let src_entry = if is_dir { None } else { st.cache.entry_for(src) };
 
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    }
+    let parent = parent_dir(target);
+    fs::create_dir_all(&parent).with_context(|| format!("creating {}", parent.display()))?;
     if target.exists() && opts.force {
         if target.is_dir() {
             fs::remove_dir_all(target)
@@ -214,25 +221,21 @@ fn move_one(src: &Path, target: &Path, opts: &OpOptions, st: &mut State) -> Resu
         // manifests list only files, so nothing to update there. The fallback
         // path staged target entries via copy_tree.
     } else {
-        if let Some(p) = src.parent() {
-            st.affected.insert(p.to_path_buf());
-        }
+        st.affected.insert(parent_dir(src));
         if let Some(mut e) = src_entry {
             set_mtime(target, e.mtime_ns);
             if let Ok(md) = fs::metadata(target) {
                 e.size = md.len();
                 e.mtime_ns = mtime_ns(&md);
             }
-            if let (Some(dir), Some(name)) = (target.parent(), target.file_name()) {
+            if let Some(name) = target.file_name() {
                 st.staged
-                    .entry(dir.to_path_buf())
+                    .entry(parent_dir(target))
                     .or_default()
                     .push((name.to_string_lossy().to_string(), e));
             }
         }
-        if let Some(p) = target.parent() {
-            st.affected.insert(p.to_path_buf());
-        }
+        st.affected.insert(parent_dir(target));
     }
 
     if !opts.quiet {
@@ -283,9 +286,7 @@ pub fn rm(paths: &[PathBuf], opts: &OpOptions, scan_opts: &ScanOptions) -> Resul
             // Parent manifests list only files, so no manifest update is needed.
         } else {
             fs::remove_file(p).with_context(|| format!("removing {}", p.display()))?;
-            if let Some(parent) = p.parent() {
-                st.affected.insert(parent.to_path_buf());
-            }
+            st.affected.insert(parent_dir(p));
             if !opts.quiet {
                 println!("removed {}", p.display());
             }
