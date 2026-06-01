@@ -58,8 +58,9 @@ enum Command {
 
 #[derive(Args)]
 struct CommonArgs {
-    /// Starting path to traverse.
-    path: PathBuf,
+    /// One or more starting paths to traverse.
+    #[arg(required = true, num_args = 1.., value_name = "PATH")]
+    roots: Vec<PathBuf>,
     /// Hash algorithm.
     #[arg(long, value_enum, default_value_t = HashAlgo::Blake3)]
     hash: HashAlgo,
@@ -260,8 +261,9 @@ struct RmArgs {
 
 #[derive(Args)]
 struct InventoryArgs {
-    /// Starting path to aggregate.
-    path: PathBuf,
+    /// One or more starting paths to aggregate.
+    #[arg(required = true, num_args = 1.., value_name = "PATH")]
+    paths: Vec<PathBuf>,
     /// Output format.
     #[arg(long, value_enum, default_value_t = Format::Json)]
     format: Format,
@@ -317,7 +319,10 @@ fn run(cli: Cli) -> Result<()> {
         Command::Scan(a) => {
             set_workers(a.common.workers);
             let opts = build_options(&a.common, a.dry_run)?;
-            let stats = scan::scan(&a.common.path, &opts)?;
+            let mut stats = scan::ScanStats::default();
+            for root in &a.common.roots {
+                stats = stats.merge(scan::scan(root, &opts)?);
+            }
             if !opts.quiet {
                 let prefix = if a.dry_run { "dry-run: " } else { "" };
                 println!("{prefix}{stats}");
@@ -325,14 +330,18 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Inventory(a) => {
-            let records = inventory::build_inventory(&a.path)?;
+            let mut records = Vec::new();
+            for path in &a.paths {
+                records.extend(inventory::build_inventory(path)?);
+            }
+            records.sort_by(|x, y| x.path.cmp(&y.path));
             inventory::write_inventory(&records, a.format, a.output.as_deref())?;
             Ok(())
         }
         Command::Watch(a) => {
             set_workers(a.common.workers);
             let opts = build_options(&a.common, false)?;
-            watch::watch(&a.common.path, &opts, a.debounce_ms)
+            watch::watch(&a.common.roots, &opts, a.debounce_ms)
         }
         Command::Dedup(a) => {
             set_workers(a.common.workers);
@@ -343,7 +352,7 @@ fn run(cli: Cli) -> Result<()> {
                 write_links: !a.no_dedup_link,
                 dry_run: a.dry_run,
             };
-            dedup::dedup(&a.common.path, &scan_opts, &dd)
+            dedup::dedup(&a.common.roots, &scan_opts, &dd)
         }
         Command::Diff(a) => {
             set_workers(a.workers);

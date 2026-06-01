@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "updated_at": "2026-05-30T15:17:26.396923Z",
+  "files": {
+    ".gitignore": {
+      "size": 8,
+      "mtime_ns": 1780064732134607694,
+      "hash": "cb43051e103f43408ad06fe1c44cea0492f41d473265615ec4cede6939a4f7e0",
+      "algo": "blake3",
+      "flags": [
+        "hidden"
+      ],
+      "hashed_at": "2026-05-30T15:17:26.396922Z"
+    },
+    "ARCHITECTURE.md": {
+      "size": 5484,
+      "mtime_ns": 1780064939553382765,
+      "hash": "bb338b6aee73f7d44f3118fcb157af93d961b6bdd18cdc5e813a436ccfd6580a",
+      "algo": "blake3",
+      "flags": [],
+      "hashed_at": "2026-05-30T15:17:26.396922Z"
+    },
+    "Cargo.lock": {
+      "size": 32404,
+      "mtime_ns": 1780067573132752541,
+      "hash": "5bca75f47ef5db41dfc340f284474b07ddcbf4c827d76fb88f757f91e28ddc5e",
+      "algo": "blake3",
+      "flags": [],
+      "hashed_at": "2026-05-30T15:17:26.396922Z"
+    },
+    "Cargo.toml": {
+      "size": 670,
+      "mtime_ns": 1780067569371393894,
+      "hash": "d20e211ae75759b7edb5d0342188fe7ec2cecd6b4813ea93077f23c39d27c7f9",
+      "algo": "blake3",
+      "flags": [],
+      "hashed_at": "2026-05-30T15:17:26.396922Z"
+    },
+    "README.md": {
+      "size": 5412,
+      "mtime_ns": 1780064911049985097,
+      "hash": "8fb9b33779653e04b2ea18124aaa7ea89716a1a15a2c38c154c22fbd1ef1c1b2",
+      "algo": "blake3",
+      "flags": [],
+      "hashed_at": "2026-05-30T15:17:26.396923Z"
+    }
+  }
+}

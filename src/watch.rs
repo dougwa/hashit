@@ -8,17 +8,25 @@ use notify::{RecursiveMode, Watcher};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult};
 
 use crate::manifest::is_manifest_file;
-use crate::scan::{is_apple_double, process_dir, scan, ScanOptions};
+use crate::scan::{is_apple_double, process_dir, scan, ScanOptions, ScanStats};
 
-/// Run a full scan, then watch `root` recursively and keep `.hashit` manifests
-/// updated as files are added, changed, or removed. Blocks until interrupted.
-pub fn watch(root: &std::path::Path, opts: &ScanOptions, debounce_ms: u64) -> Result<()> {
-    // Canonicalize so we can reliably compare event paths against the root.
-    let root = root
-        .canonicalize()
-        .with_context(|| format!("resolving {}", root.display()))?;
+/// Run a full scan, then watch every `root` recursively and keep `.hashit`
+/// manifests updated as files are added, changed, or removed. Blocks until
+/// interrupted.
+pub fn watch(roots: &[PathBuf], opts: &ScanOptions, debounce_ms: u64) -> Result<()> {
+    // Canonicalize so we can reliably compare event paths against the roots.
+    let roots: Vec<PathBuf> = roots
+        .iter()
+        .map(|r| {
+            r.canonicalize()
+                .with_context(|| format!("resolving {}", r.display()))
+        })
+        .collect::<Result<_>>()?;
 
-    let stats = scan(&root, opts)?;
+    let mut stats = ScanStats::default();
+    for root in &roots {
+        stats = stats.merge(scan(root, opts)?);
+    }
     if !opts.quiet {
         println!("initial scan: {stats}");
     }
@@ -28,16 +36,19 @@ pub fn watch(root: &std::path::Path, opts: &ScanOptions, debounce_ms: u64) -> Re
         let _ = tx.send(res);
     })
     .context("creating filesystem watcher")?;
-    debouncer
-        .watcher()
-        .watch(&root, RecursiveMode::Recursive)
-        .with_context(|| format!("watching {}", root.display()))?;
-    debouncer.cache().add_root(&root, RecursiveMode::Recursive);
+    for root in &roots {
+        debouncer
+            .watcher()
+            .watch(root, RecursiveMode::Recursive)
+            .with_context(|| format!("watching {}", root.display()))?;
+        debouncer.cache().add_root(root, RecursiveMode::Recursive);
+    }
 
     if !opts.quiet {
+        let list: Vec<String> = roots.iter().map(|r| r.display().to_string()).collect();
         println!(
             "watching {} (debounce {debounce_ms}ms) — press Ctrl-C to stop",
-            root.display()
+            list.join(", ")
         );
     }
 
@@ -71,10 +82,19 @@ pub fn watch(root: &std::path::Path, opts: &ScanOptions, debounce_ms: u64) -> Re
                     }
                 }
                 for d in dirs {
-                    if !d.starts_with(&root) || !d.is_dir() {
+                    // Attribute each directory to the watched root that contains
+                    // it (longest match wins for nested roots); skip stray events.
+                    let Some(root) = roots
+                        .iter()
+                        .filter(|r| d.starts_with(r))
+                        .max_by_key(|r| r.components().count())
+                    else {
+                        continue;
+                    };
+                    if !d.is_dir() {
                         continue;
                     }
-                    match process_dir(&d, opts, &root) {
+                    match process_dir(&d, opts, root) {
                         Ok((s, changed)) => {
                             if changed && !opts.quiet {
                                 println!("updated {} — {s}", d.display());

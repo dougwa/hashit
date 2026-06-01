@@ -82,7 +82,7 @@ pub struct ScanStats {
 }
 
 impl ScanStats {
-    fn merge(mut self, other: ScanStats) -> ScanStats {
+    pub fn merge(mut self, other: ScanStats) -> ScanStats {
         self.new += other.new;
         self.modified += other.modified;
         self.unchanged += other.unchanged;

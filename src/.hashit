@@ -1,0 +1,86 @@
+{
+  "version": 1,
+  "updated_at": "2026-05-30T15:17:29.969556Z",
+  "files": {
+    "dedup.rs": {
+      "size": 9485,
+      "mtime_ns": 1780067589967151473,
+      "hash": "e8accedf2de74b8b42cb1ae3b8f137135e272991d0082d8699c8ce71963d17db",
+      "algo": "blake3",
+      "flags": [],
+      "hashed_at": "2026-05-30T15:17:29.969553Z"
+    },
+    "diff.rs": {
+      "size": 8372,
+      "mtime_ns": 1780036124274862263,
+      "hash": "87621ed8e19bd4eaac670dd1febebe5e2e1585855b9e7bf2014b3f482d3457a4",
+      "algo": "blake3",
+      "flags": [],
+      "hashed_at": "2026-05-30T15:17:29.969554Z"
+    },
+    "fileops.rs": {
+      "size": 10864,
+      "mtime_ns": 1780068103965315357,
+      "hash": "9ca163608feb2bad5a6b1a3aadb34b9346ab7f1f9c648c8f7d1ae97f13e4b4e2",
+      "algo": "blake3",
+      "flags": [],
+      "hashed_at": "2026-05-30T15:17:29.969554Z"
+    },
+    "hash.rs": {
+      "size": 1660,
+      "mtime_ns": 1780008200147892875,
+      "hash": "cf78ae82da95d1ddd5ee1702adfd187861b93374090531b1b775ea57b309a2b9",
+      "algo": "blake3",
+      "flags": [],
+      "hashed_at": "2026-05-30T15:17:29.969554Z"
+    },
+    "inventory.rs": {
+      "size": 3103,
+      "mtime_ns": 1780008251002394948,
+      "hash": "d2d88b597e0ae3e427e14a3b3e1f390958b6de737f13d878dd1ee372b0437481",
+      "algo": "blake3",
+      "flags": [],
+      "hashed_at": "2026-05-30T15:17:29.969555Z"
+    },
+    "main.rs": {
+      "size": 13438,
+      "mtime_ns": 1780063642888644356,
+      "hash": "f9393b16a50ce30e4e23cfe35c35b01cc0119295d9c242f857f82fd6e788af88",
+      "algo": "blake3",
+      "flags": [],
+      "hashed_at": "2026-05-30T15:17:29.969555Z"
+    },
+    "manifest.rs": {
+      "size": 5348,
+      "mtime_ns": 1780063541474810206,
+      "hash": "a2566ae3b50e3354d5b93a5832fee4c36f7942c352a6dead1c12b9e760da1883",
+      "algo": "blake3",
+      "flags": [],
+      "hashed_at": "2026-05-30T15:17:29.969555Z"
+    },
+    "scan.rs": {
+      "size": 11983,
+      "mtime_ns": 1780032569214754465,
+      "hash": "b856ab091014de11cb5786e4fdaaaa47ca251bde86af1e5c318da686217520c4",
+      "algo": "blake3",
+      "flags": [],
+      "hashed_at": "2026-05-30T15:17:29.969555Z"
+    },
+    "sync.rs": {
+      "size": 7474,
+      "mtime_ns": 1780063565309780909,
+      "hash": "7c43bb2fdff05e912814490f1338cce03c9ee47fabf2ca9b895d327164847f39",
+      "algo": "blake3",
+      "flags": [],
+      "hashed_at": "2026-05-30T15:17:29.969555Z"
+    },
+    "watch.rs": {
+      "size": 3830,
+      "mtime_ns": 1780029590557660638,
+      "hash": "774cdfb1b790c27fa37a3315897a1161fc3bb6deedb037dd2bba0e47b4916c10",
+      "algo": "blake3",
+      "flags": [],
+      "hashed_at": "2026-05-30T15:17:29.969555Z"
+    }
+  }
+}

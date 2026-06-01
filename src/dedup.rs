@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use console::{Key, Term};
 
 use crate::inventory::build_inventory;
-use crate::scan::{process_dir, scan, ScanOptions, DEDUP_SUFFIX};
+use crate::scan::{process_dir, scan, ScanOptions, ScanStats, DEDUP_SUFFIX};
 
 pub struct DedupOptions {
     /// When true, prompt per duplicate set; otherwise auto-select.
@@ -21,7 +21,11 @@ pub struct DedupOptions {
 /// One candidate file within a duplicate set, with precomputed sort keys.
 struct Candidate {
     abs: PathBuf,
+    /// Path relative to its root; drives the ranking heuristic.
     rel: String,
+    /// What to show the user: the root-relative path for a single root, or the
+    /// absolute path when deduping across multiple roots (so it's unambiguous).
+    display: String,
     size: u64,
     hidden: bool,
     slashes: usize,
@@ -173,30 +177,47 @@ fn remove_one(removed: &Path, kept: &Path, opts: &DedupOptions) -> Result<()> {
     Ok(())
 }
 
-pub fn dedup(root: &Path, scan_opts: &ScanOptions, dd: &DedupOptions) -> Result<()> {
-    let root = root
-        .canonicalize()
-        .with_context(|| format!("resolving {}", root.display()))?;
+pub fn dedup(roots: &[PathBuf], scan_opts: &ScanOptions, dd: &DedupOptions) -> Result<()> {
+    let roots: Vec<PathBuf> = roots
+        .iter()
+        .map(|r| {
+            r.canonicalize()
+                .with_context(|| format!("resolving {}", r.display()))
+        })
+        .collect::<Result<_>>()?;
+    let multi = roots.len() > 1;
 
     // 1) Bring every manifest up to date before reading hashes.
-    let stats = scan(&root, scan_opts)?;
+    let mut stats = ScanStats::default();
+    for root in &roots {
+        stats = stats.merge(scan(root, scan_opts)?);
+    }
     if !scan_opts.quiet {
         println!("scan: {stats}");
     }
 
-    // 2) Group files by (algo, hash). Different algos never share a set.
+    // 2) Group files by (algo, hash) across every root. Different algos never
+    //    share a set. Deduping multiple roots finds duplicates between them.
     let mut groups: BTreeMap<(String, String), Vec<Candidate>> = BTreeMap::new();
-    for r in build_inventory(&root)? {
-        let abs = root.join(&r.path);
-        let hidden = rel_is_hidden(&r.path);
-        let slashes = r.path.matches('/').count();
-        groups.entry((r.algo, r.hash)).or_default().push(Candidate {
-            abs,
-            rel: r.path,
-            size: r.size,
-            hidden,
-            slashes,
-        });
+    for root in &roots {
+        for r in build_inventory(root)? {
+            let abs = root.join(&r.path);
+            let hidden = rel_is_hidden(&r.path);
+            let slashes = r.path.matches('/').count();
+            let display = if multi {
+                abs.display().to_string()
+            } else {
+                r.path.clone()
+            };
+            groups.entry((r.algo, r.hash)).or_default().push(Candidate {
+                abs,
+                rel: r.path,
+                display,
+                size: r.size,
+                hidden,
+                slashes,
+            });
+        }
     }
 
     let mut auto = !dd.interactive;
@@ -221,7 +242,7 @@ pub fn dedup(root: &Path, scan_opts: &ScanOptions, dd: &DedupOptions) -> Result<
             );
             for (i, c) in cands.iter().enumerate() {
                 let marker = if i == 0 { " (auto-keep)" } else { "" };
-                println!("  {}) {}{marker}", i + 1, c.rel);
+                println!("  {}) {}{marker}", i + 1, c.display);
             }
             match prompt_choice(cands.len())? {
                 Choice::Keep(i) => Some(i),
@@ -241,10 +262,10 @@ pub fn dedup(root: &Path, scan_opts: &ScanOptions, dd: &DedupOptions) -> Result<
         };
         kept += 1;
         let kept_abs = cands[keep].abs.clone();
-        let kept_rel = cands[keep].rel.clone();
+        let kept_display = cands[keep].display.clone();
         if !scan_opts.quiet {
             let verb = if dd.dry_run { "would keep" } else { "keep" };
-            println!("  {verb} {kept_rel}");
+            println!("  {verb} {kept_display}");
         }
         for (i, c) in cands.iter().enumerate() {
             if i == keep {
@@ -257,7 +278,7 @@ pub fn dedup(root: &Path, scan_opts: &ScanOptions, dd: &DedupOptions) -> Result<
             }
             if !scan_opts.quiet {
                 let verb = if dd.dry_run { "would remove" } else { "removed" };
-                println!("  {verb} {}", c.rel);
+                println!("  {verb} {}", c.display);
             }
         }
     }
@@ -269,7 +290,14 @@ pub fn dedup(root: &Path, scan_opts: &ScanOptions, dd: &DedupOptions) -> Result<
         refresh.verbose = false;
         refresh.status = false;
         for d in &affected {
-            let _ = process_dir(d, &refresh, &root);
+            // Reconcile against the root that owns the directory (longest match).
+            if let Some(root) = roots
+                .iter()
+                .filter(|r| d.starts_with(r))
+                .max_by_key(|r| r.components().count())
+            {
+                let _ = process_dir(d, &refresh, root);
+            }
         }
     }
 

@@ -53,40 +53,44 @@ skipped unless `--follow-symlinks` is given.
 ### scan — build/update manifests
 
 ```sh
-hashit scan <path> [--hash blake3|sha256] [--workers N] [--exclude GLOB]...
-                   [--follow-symlinks] [--include-apple-double]
-                   [--status] [-v|--verbose] [-q|--quiet] [--dry-run]
+hashit scan <path>... [--hash blake3|sha256] [--workers N] [--exclude GLOB]...
+                      [--follow-symlinks] [--include-apple-double]
+                      [--status] [-v|--verbose] [-q|--quiet] [--dry-run]
 ```
 
-Traverses `path`, updating every directory's `.hashit`. Removes entries for files
-that no longer exist. `--status` prints a `new`/`modified`/`unchanged`/`removed`
-line per file; `--dry-run` reports changes without writing.
+Traverses each `path`, updating every directory's `.hashit`. Removes entries for
+files that no longer exist. `--status` prints a `new`/`modified`/`unchanged`/`removed`
+line per file; `--dry-run` reports changes without writing. Pass several paths to
+scan multiple roots in one run (the summary is combined).
 
 ### inventory — one aggregated report
 
 ```sh
-hashit inventory <path> [--format json|csv] [-o|--output FILE]
+hashit inventory <path>... [--format json|csv] [-o|--output FILE]
 ```
 
-Walks all `.hashit` files under `path` and emits a single sorted report (relative
-path, hash, flags, size, timestamps) to stdout or a file.
+Walks all `.hashit` files under each `path` and emits a single sorted report
+(relative path, hash, flags, size, timestamps) to stdout or a file. With multiple
+paths the records are merged into one report.
 
 ### watch — real-time updates
 
 ```sh
-hashit watch <path> [scan options] [--debounce-ms 500]
+hashit watch <path>... [scan options] [--debounce-ms 500]
 ```
 
-Runs a scan, then watches recursively and updates `.hashit` files as files are
-added, changed, or removed.
+Runs a scan, then watches each path recursively and updates `.hashit` files as
+files are added, changed, or removed.
 
 ### dedup — remove duplicate content
 
 ```sh
-hashit dedup <path> (-i|--interactive | -a|--auto) [--no-dedup-link] [--dry-run]
+hashit dedup <path>... (-i|--interactive | -a|--auto) [--no-dedup-link] [--dry-run]
 ```
 
-Scans, groups files by hash, then resolves each duplicate set.
+Scans, groups files by hash, then resolves each duplicate set. Pass several paths
+to find duplicates **across** roots (e.g. between two drives); matches are then
+shown by absolute path.
 - `-a/--auto` keeps the best file: **non-hidden first, then fewest `/`, then
   alphabetical**, removing the rest.
 - `-i/--interactive` prompts per set: a number to keep, `s` to skip, `a` to
