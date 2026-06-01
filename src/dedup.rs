@@ -200,7 +200,7 @@ pub fn dedup(roots: &[PathBuf], scan_opts: &ScanOptions, dd: &DedupOptions) -> R
     //    share a set. Deduping multiple roots finds duplicates between them.
     let mut groups: BTreeMap<(String, String), Vec<Candidate>> = BTreeMap::new();
     for root in &roots {
-        for r in build_inventory(root)? {
+        for r in build_inventory(root, scan_opts)? {
             let abs = root.join(&r.path);
             let hidden = rel_is_hidden(&r.path);
             let slashes = r.path.matches('/').count();

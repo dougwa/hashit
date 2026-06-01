@@ -155,8 +155,8 @@ pub fn sync(p1: &Path, p2: &Path, scan_opts: &ScanOptions, so: &SyncOptions) -> 
     }
 
     // Index both sides once, up front, so copies don't perturb the comparison.
-    let idx1 = collect(&r1)?;
-    let idx2 = collect(&r2)?;
+    let idx1 = collect(&r1, scan_opts)?;
+    let idx2 = collect(&r2, scan_opts)?;
 
     let q = scan_opts.quiet;
     let s1 = Side { root: &r1, idx: &idx1 };

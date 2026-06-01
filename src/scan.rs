@@ -16,6 +16,11 @@ pub struct ScanOptions {
     pub algo: HashAlgo,
     pub follow_symlinks: bool,
     pub excludes: Vec<Pattern>,
+    /// Substrings to ignore anywhere in a path (matched against the path
+    /// relative to the scan root). A matching directory is pruned rather than
+    /// recursed; a matching file is skipped. Sourced from `--ignore` and the
+    /// `HASHIT_IGNORE` environment variable.
+    pub ignores: Vec<String>,
     pub quiet: bool,
     pub verbose: bool,
     /// Print a status line (new/modified/unchanged/removed) for every file.
@@ -66,6 +71,23 @@ impl ScanOptions {
         self.excludes
             .iter()
             .any(|p| p.matches(&name) || p.matches(&rel))
+    }
+
+    /// True if any ignore substring appears anywhere in `path` (checked against
+    /// the path relative to `root`, falling back to the full path). Unlike
+    /// excludes these are plain substrings, not globs.
+    pub fn is_ignored(&self, path: &Path, root: &Path) -> bool {
+        if self.ignores.is_empty() {
+            return false;
+        }
+        let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy();
+        self.ignores.iter().any(|s| rel.contains(s.as_str()))
+    }
+
+    /// True if `path` should be skipped entirely: excluded by glob or ignored
+    /// by substring.
+    pub fn is_skipped(&self, path: &Path, root: &Path) -> bool {
+        self.is_excluded(path, root) || self.is_ignored(path, root)
     }
 }
 
@@ -192,7 +214,7 @@ pub fn process_dir(dir: &Path, opts: &ScanOptions, root: &Path) -> Result<(ScanS
             continue;
         }
         let path = entry.path();
-        if opts.is_excluded(&path, root) {
+        if opts.is_skipped(&path, root) {
             continue;
         }
         let ft = match entry.file_type() {
@@ -342,7 +364,7 @@ pub fn scan(root: &Path, opts: &ScanOptions) -> Result<ScanStats> {
             if e.depth() == 0 {
                 return true;
             }
-            !(e.file_type().is_dir() && opts.is_excluded(e.path(), root))
+            !(e.file_type().is_dir() && opts.is_skipped(e.path(), root))
         });
     for entry in walker {
         match entry {

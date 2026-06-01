@@ -33,9 +33,9 @@ pub(crate) type HashIndex = BTreeMap<(String, String), Vec<String>>;
 /// One side's unique entries: references into a HashIndex.
 type Entries<'a> = Vec<(&'a (String, String), &'a Vec<String>)>;
 
-pub(crate) fn collect(root: &Path) -> Result<HashIndex> {
+pub(crate) fn collect(root: &Path, opts: &ScanOptions) -> Result<HashIndex> {
     let mut idx: HashIndex = BTreeMap::new();
-    for r in build_inventory(root)? {
+    for r in build_inventory(root, opts)? {
         idx.entry((r.algo, r.hash)).or_default().push(r.path);
     }
     for files in idx.values_mut() {
@@ -154,8 +154,8 @@ pub fn diff(p1: &Path, p2: &Path, scan_opts: &ScanOptions, dd: &DiffOptions) -> 
         }
     }
 
-    let m1 = collect(&r1)?;
-    let m2 = collect(&r2)?;
+    let m1 = collect(&r1, scan_opts)?;
+    let m2 = collect(&r2, scan_opts)?;
 
     // Warn if the two trees use entirely different hash algorithms.
     let algos1: BTreeSet<&str> = m1.keys().map(|(a, _)| a.as_str()).collect();

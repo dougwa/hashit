@@ -73,6 +73,10 @@ struct CommonArgs {
     /// Glob to exclude (matched against basename and path relative to root). Repeatable.
     #[arg(long = "exclude", value_name = "GLOB")]
     excludes: Vec<String>,
+    /// Substring to ignore anywhere in a path; matching directories are not
+    /// recursed. Repeatable, also splits on '|', and defaults from $HASHIT_IGNORE.
+    #[arg(long = "ignore", value_name = "STR")]
+    ignores: Vec<String>,
     /// Suppress per-file and error output.
     #[arg(long, short)]
     quiet: bool,
@@ -141,6 +145,10 @@ struct DiffArgs {
     /// Glob to exclude (matched against basename and path relative to root). Repeatable.
     #[arg(long = "exclude", value_name = "GLOB")]
     excludes: Vec<String>,
+    /// Substring to ignore anywhere in a path; matching directories are not
+    /// recursed. Repeatable, also splits on '|', and defaults from $HASHIT_IGNORE.
+    #[arg(long = "ignore", value_name = "STR")]
+    ignores: Vec<String>,
     /// Include macOS AppleDouble (._*) sidecar files instead of skipping them.
     #[arg(long)]
     include_apple_double: bool,
@@ -179,6 +187,10 @@ struct SyncArgs {
     /// Glob to exclude (matched against basename and path relative to root). Repeatable.
     #[arg(long = "exclude", value_name = "GLOB")]
     excludes: Vec<String>,
+    /// Substring to ignore anywhere in a path; matching directories are not
+    /// recursed. Repeatable, also splits on '|', and defaults from $HASHIT_IGNORE.
+    #[arg(long = "ignore", value_name = "STR")]
+    ignores: Vec<String>,
     /// Include macOS AppleDouble (._*) sidecar files instead of skipping them.
     #[arg(long)]
     include_apple_double: bool,
@@ -204,6 +216,11 @@ struct CpArgs {
     /// Overwrite existing files in the target.
     #[arg(short, long)]
     force: bool,
+    /// Substring to ignore anywhere in a path during the on-demand scan;
+    /// matching directories are not recursed. Repeatable, also splits on '|',
+    /// and defaults from $HASHIT_IGNORE.
+    #[arg(long = "ignore", value_name = "STR")]
+    ignores: Vec<String>,
     /// Hash algorithm for files lacking a source manifest entry.
     #[arg(long, value_enum, default_value_t = HashAlgo::Blake3)]
     hash: HashAlgo,
@@ -226,6 +243,11 @@ struct MvArgs {
     /// Overwrite an existing destination.
     #[arg(short, long)]
     force: bool,
+    /// Substring to ignore anywhere in a path during the on-demand scan;
+    /// matching directories are not recursed. Repeatable, also splits on '|',
+    /// and defaults from $HASHIT_IGNORE.
+    #[arg(long = "ignore", value_name = "STR")]
+    ignores: Vec<String>,
     /// Hash algorithm for files lacking a source manifest entry.
     #[arg(long, value_enum, default_value_t = HashAlgo::Blake3)]
     hash: HashAlgo,
@@ -248,6 +270,11 @@ struct RmArgs {
     /// Ignore nonexistent files; never error on missing operands.
     #[arg(short, long)]
     force: bool,
+    /// Substring to ignore anywhere in a path during the on-demand scan;
+    /// matching directories are not recursed. Repeatable, also splits on '|',
+    /// and defaults from $HASHIT_IGNORE.
+    #[arg(long = "ignore", value_name = "STR")]
+    ignores: Vec<String>,
     /// Hash algorithm used when reconciling affected manifests.
     #[arg(long, value_enum, default_value_t = HashAlgo::Blake3)]
     hash: HashAlgo,
@@ -270,6 +297,32 @@ struct InventoryArgs {
     /// Write to a file instead of stdout.
     #[arg(long, short)]
     output: Option<PathBuf>,
+    /// Hash algorithm for the scan that precedes aggregation.
+    #[arg(long, value_enum, default_value_t = HashAlgo::Blake3)]
+    hash: HashAlgo,
+    /// Number of hashing threads (0 = number of CPUs).
+    #[arg(long, default_value_t = 0)]
+    workers: usize,
+    /// Follow symbolic links.
+    #[arg(long)]
+    follow_symlinks: bool,
+    /// Glob to exclude (matched against basename and path relative to root). Repeatable.
+    #[arg(long = "exclude", value_name = "GLOB")]
+    excludes: Vec<String>,
+    /// Substring to ignore anywhere in a path; matching directories are not
+    /// recursed and matching files are omitted. Repeatable, also splits on '|',
+    /// and defaults from $HASHIT_IGNORE.
+    #[arg(long = "ignore", value_name = "STR")]
+    ignores: Vec<String>,
+    /// Include macOS AppleDouble (._*) sidecar files instead of skipping them.
+    #[arg(long)]
+    include_apple_double: bool,
+    /// Suppress scan progress output (sent to stderr).
+    #[arg(long, short)]
+    quiet: bool,
+    /// Aggregate existing .hashit manifests as-is, without scanning first.
+    #[arg(long)]
+    no_scan: bool,
 }
 
 fn parse_excludes(globs: &[String]) -> Result<Vec<Pattern>> {
@@ -280,11 +333,27 @@ fn parse_excludes(globs: &[String]) -> Result<Vec<Pattern>> {
     Ok(excludes)
 }
 
+/// Merge ignore substrings from `$HASHIT_IGNORE` and the repeatable `--ignore`
+/// flag. Both sources split on '|'; empty segments are dropped (an empty
+/// substring would otherwise match every path).
+fn collect_ignores(cli: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Ok(env) = std::env::var("HASHIT_IGNORE") {
+        out.extend(env.split('|').map(str::to_string));
+    }
+    for v in cli {
+        out.extend(v.split('|').map(str::to_string));
+    }
+    out.retain(|s| !s.is_empty());
+    out
+}
+
 fn build_options(c: &CommonArgs, dry_run: bool) -> Result<ScanOptions> {
     Ok(ScanOptions {
         algo: c.hash,
         follow_symlinks: c.follow_symlinks,
         excludes: parse_excludes(&c.excludes)?,
+        ignores: collect_ignores(&c.ignores),
         quiet: c.quiet,
         verbose: c.verbose,
         status: c.status,
@@ -301,11 +370,12 @@ fn set_workers(n: usize) {
 
 /// Minimal scan options for the file ops (cp/mv/rm): they only need the algo
 /// for reconciling affected manifests, and quiet to gate output.
-fn fileop_scan_opts(hash: HashAlgo, quiet: bool) -> ScanOptions {
+fn fileop_scan_opts(hash: HashAlgo, quiet: bool, ignores: Vec<String>) -> ScanOptions {
     ScanOptions {
         algo: hash,
         follow_symlinks: false,
         excludes: Vec::new(),
+        ignores,
         quiet,
         verbose: false,
         status: false,
@@ -330,9 +400,24 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Inventory(a) => {
+            set_workers(a.workers);
+            let scan_opts = ScanOptions {
+                algo: a.hash,
+                follow_symlinks: a.follow_symlinks,
+                excludes: parse_excludes(&a.excludes)?,
+                ignores: collect_ignores(&a.ignores),
+                quiet: a.quiet,
+                verbose: false,
+                status: false,
+                skip_apple_double: !a.include_apple_double,
+                dry_run: false,
+            };
             let mut records = Vec::new();
             for path in &a.paths {
-                records.extend(inventory::build_inventory(path)?);
+                if !a.no_scan {
+                    scan::scan(path, &scan_opts)?;
+                }
+                records.extend(inventory::build_inventory(path, &scan_opts)?);
             }
             records.sort_by(|x, y| x.path.cmp(&y.path));
             inventory::write_inventory(&records, a.format, a.output.as_deref())?;
@@ -360,6 +445,7 @@ fn run(cli: Cli) -> Result<()> {
                 algo: a.hash,
                 follow_symlinks: a.follow_symlinks,
                 excludes: parse_excludes(&a.excludes)?,
+                ignores: collect_ignores(&a.ignores),
                 quiet: a.quiet,
                 verbose: false,
                 status: false,
@@ -379,6 +465,7 @@ fn run(cli: Cli) -> Result<()> {
                 algo: a.hash,
                 follow_symlinks: a.follow_symlinks,
                 excludes: parse_excludes(&a.excludes)?,
+                ignores: collect_ignores(&a.ignores),
                 quiet: a.quiet,
                 verbose: false,
                 status: false,
@@ -394,7 +481,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Command::Cp(a) => {
             set_workers(a.workers);
-            let scan_opts = fileop_scan_opts(a.hash, a.quiet);
+            let scan_opts = fileop_scan_opts(a.hash, a.quiet, collect_ignores(&a.ignores));
             let opts = OpOptions {
                 recursive: a.recursive,
                 force: a.force,
@@ -404,7 +491,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Command::Mv(a) => {
             set_workers(a.workers);
-            let scan_opts = fileop_scan_opts(a.hash, a.quiet);
+            let scan_opts = fileop_scan_opts(a.hash, a.quiet, collect_ignores(&a.ignores));
             let opts = OpOptions {
                 recursive: a.recursive,
                 force: a.force,
@@ -414,7 +501,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Command::Rm(a) => {
             set_workers(a.workers);
-            let scan_opts = fileop_scan_opts(a.hash, a.quiet);
+            let scan_opts = fileop_scan_opts(a.hash, a.quiet, collect_ignores(&a.ignores));
             let opts = OpOptions {
                 recursive: a.recursive,
                 force: a.force,

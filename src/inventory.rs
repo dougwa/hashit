@@ -8,6 +8,7 @@ use serde::Serialize;
 use walkdir::WalkDir;
 
 use crate::manifest::{ns_to_rfc3339, Manifest, MANIFEST_NAME};
+use crate::scan::ScanOptions;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Format {
@@ -40,10 +41,18 @@ fn to_slash(p: &Path) -> String {
     parts.join("/")
 }
 
-/// Walk every `.hashit` under `root` and aggregate entries into a sorted report.
-pub fn build_inventory(root: &Path) -> Result<Vec<InventoryRecord>> {
+/// Walk every `.hashit` under `root` and aggregate entries into a sorted
+/// report. Directories matching the ignore/exclude rules are pruned (their
+/// manifests are never read), and individual entries that match are dropped,
+/// so the report mirrors what a scan with the same options would record.
+pub fn build_inventory(root: &Path, opts: &ScanOptions) -> Result<Vec<InventoryRecord>> {
     let mut records: Vec<InventoryRecord> = Vec::new();
-    for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+    let walker = WalkDir::new(root).into_iter().filter_entry(|e| {
+        // Mirror the scan walk: never prune the root, but skip ignored/excluded
+        // subtrees so stale manifests left inside them aren't aggregated.
+        e.depth() == 0 || !(e.file_type().is_dir() && opts.is_skipped(e.path(), root))
+    });
+    for entry in walker.filter_map(|e| e.ok()) {
         if !entry.file_type().is_file() || entry.file_name() != MANIFEST_NAME {
             continue;
         }
@@ -56,6 +65,11 @@ pub fn build_inventory(root: &Path) -> Result<Vec<InventoryRecord>> {
         for (name, fe) in manifest.files {
             let mut full: PathBuf = rel_dir.to_path_buf();
             full.push(&name);
+            // Drop entries that match ignore/exclude (e.g. files recorded by an
+            // earlier scan run without these options).
+            if opts.is_skipped(&dir.join(&name), root) {
+                continue;
+            }
             records.push(InventoryRecord {
                 path: to_slash(&full),
                 hash: fe.hash,
