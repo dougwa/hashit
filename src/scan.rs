@@ -184,14 +184,26 @@ fn needs_hash(old: Option<&FileEntry>, size: u64, mtime: u64, algo: HashAlgo) ->
 /// `.hashit` manifest, dropping entries for files that no longer exist.
 /// Returns the stats and whether the manifest changed on disk.
 pub fn process_dir(dir: &Path, opts: &ScanOptions, root: &Path) -> Result<(ScanStats, bool)> {
-    let old_files: BTreeMap<String, FileEntry> = Manifest::load(dir)?
-        .map(|m| m.files)
-        .unwrap_or_default();
+    // An unreadable or corrupt .hashit must not abort the scan: treat it as
+    // absent so this directory is fully rehashed and a fresh manifest written.
+    let mut stats = ScanStats::default();
+    let (old_files, manifest_corrupt): (BTreeMap<String, FileEntry>, bool) =
+        match Manifest::load(dir) {
+            Ok(m) => (m.map(|m| m.files).unwrap_or_default(), false),
+            Err(e) => {
+                if !opts.quiet {
+                    eprintln!(
+                        "hashit: unreadable manifest in {}, regenerating: {e:#}",
+                        dir.display()
+                    );
+                }
+                (BTreeMap::new(), true)
+            }
+        };
 
     // Enumerate direct files (subdirectories get their own manifest).
     let mut current: BTreeMap<String, (bool, fs::Metadata)> = BTreeMap::new();
     let rd = fs::read_dir(dir).with_context(|| format!("reading dir {}", dir.display()))?;
-    let mut stats = ScanStats::default();
     for entry in rd {
         let entry = match entry {
             Ok(e) => e,
@@ -331,7 +343,9 @@ pub fn process_dir(dir: &Path, opts: &ScanOptions, root: &Path) -> Result<(ScanS
 
     stats.dirs_scanned += 1;
 
-    let changed = new_files != old_files;
+    // `manifest_corrupt` forces a rewrite (or delete, if now empty) so the
+    // unreadable .hashit is replaced even when the recovered set matches.
+    let changed = new_files != old_files || manifest_corrupt;
     if changed {
         stats.dirs_written += 1;
         if !opts.dry_run {
