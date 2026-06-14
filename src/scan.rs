@@ -191,12 +191,12 @@ pub fn process_dir(dir: &Path, opts: &ScanOptions, root: &Path) -> Result<(ScanS
         match Manifest::load(dir) {
             Ok(m) => (m.map(|m| m.files).unwrap_or_default(), false),
             Err(e) => {
-                if !opts.quiet {
-                    eprintln!(
-                        "hashit: unreadable manifest in {}, regenerating: {e:#}",
-                        dir.display()
-                    );
-                }
+                // Always surface this on stderr, even under --quiet: a corrupt
+                // manifest silently triggering a full rehash would be surprising.
+                eprintln!(
+                    "hashit: unreadable manifest in {}, regenerating: {e:#}",
+                    dir.display()
+                );
                 (BTreeMap::new(), true)
             }
         };
