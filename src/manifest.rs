@@ -12,13 +12,19 @@ pub const MANIFEST_NAME: &str = ".hashit";
 /// Prefix of the transient files written during an atomic manifest save.
 pub const MANIFEST_TMP_PREFIX: &str = ".hashit.tmp.";
 
+/// Per-drive identity marker written at a scanned root (see `drive.rs`).
+pub const DRIVE_MARKER_NAME: &str = ".hashit-drive";
+
 /// On-disk format version. Bump when the schema changes incompatibly.
 pub const MANIFEST_VERSION: u32 = 1;
 
-/// True if `name` is a manifest file or one of its atomic-save temp files.
-/// These must never be hashed, inventoried, or trigger watch reprocessing.
+/// True if `name` is a hashit-managed metadata file (manifest, its atomic-save
+/// temp files, or the drive marker). These must never be hashed, inventoried,
+/// indexed, or trigger watch reprocessing.
 pub fn is_manifest_file(name: &str) -> bool {
-    name == MANIFEST_NAME || name.starts_with(MANIFEST_TMP_PREFIX)
+    name == MANIFEST_NAME
+        || name == DRIVE_MARKER_NAME
+        || name.starts_with(MANIFEST_TMP_PREFIX)
 }
 
 /// One record per file directly contained in a directory.

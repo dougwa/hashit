@@ -17,6 +17,10 @@ lives in the manifest, scan, and hashing layers.
 | `diff.rs` | Content-hash set comparison between two trees. |
 | `sync.rs` | Copy content missing between two trees. |
 | `fileops.rs` | Hash-aware `cp`/`mv`/`rm`. |
+| `store.rs` | Global metadata index (SQLite) + thumbnail cache. *(`extract` feature)* |
+| `drive.rs` | Per-drive `.hashit-drive` id marker and online/offline presence. *(`extract` feature)* |
+| `extract/` | Extraction engine: file-type detection, EXIF (`exiftool_rs`), thumbnails (`magick-*`). *(`extract` feature)* |
+| `index.rs` | Orchestrates scan → store reconciliation → extract-once-per-hash; `Indexer` for incremental watch updates. *(`extract` feature)* |
 
 ## Data model (`manifest.rs`)
 
@@ -85,6 +89,39 @@ pass; acceptable for current use.)
   entry. `finalize` seeds carried entries and reconciles affected dirs with
   `process_dir` (reuses carried hashes, hashes only files lacking an entry).
 
+## Metadata index (optional `extract` feature)
+
+A second, **derived** layer sits on top of the manifests: a global, drive-aware
+index for rich metadata, keyed by content hash rather than path.
+
+- **Store (`store.rs`)** — one SQLite database at `~/.hashit/index.db`
+  (`$HASHIT_HOME` overrides; WAL + a `schema_meta` version row for migrations)
+  with a sibling `cache/` for thumbnails. Tables: `drives`, `content` (one row
+  per `(algo, hash)`), `metadata` (EAV: `key`/`value`, indexed for reverse
+  lookups), and `locations` (one row per `(algo, hash, drive, path)`). The DB is
+  rebuildable from the `.hashit` manifests, so corruption is recovered by
+  re-indexing.
+- **Drives (`drive.rs`)** — each root carries a `.hashit-drive` marker (a UUID +
+  label, written atomically like a manifest). The UUID is the stable `drive_id`;
+  it travels with the drive (works on exFAT, unlike volume UUIDs). Presence is
+  probed by checking the marker at a drive's last known root, so content can be
+  flagged offline or a drive permanently detached (purging its locations and any
+  now-orphaned content/metadata/thumbnails).
+- **Extraction (`extract/`)** — `extract_all` identifies a file from a header
+  read (`exiftool_rs::filetype`), and for images pulls EXIF (`exiftool_rs`) and a
+  downscaled JPEG thumbnail (`magick-codecs`/`magick-core`). Designed as
+  swappable free functions so an external-tool fallback can be added later.
+- **Orchestration (`index.rs`)** — `index` scans, then walks the manifests
+  (reusing `inventory::build_inventory`) and reconciles the store: a hash new to
+  the store is extracted **once** (in parallel), and every file's location is
+  upserted; stale locations on the drive are pruned. `Indexer::reconcile_dir`
+  does the same for a single directory and is driven by `watch --index` via a
+  callback, so live filesystem activity updates the index incrementally.
+
+The core `scan`/manifest path is untouched by all of this — the index is
+additive and entirely behind the `extract` feature, which also gates its heavier
+dependencies (SQLite, the metadata/image crates).
+
 ## Key invariants
 
 - A `.hashit` describes only the files directly in its directory; recursion is
@@ -101,3 +138,7 @@ pass; acceptable for current use.)
 (hashing), `walkdir` (traversal), `notify` + `notify-debouncer-full` (watch),
 `rayon` (parallel hashing), `glob` (excludes), `csv`, `chrono` (timestamps),
 `anyhow` (errors).
+
+Behind the optional `extract` feature: `rusqlite` (bundled SQLite), `uuid` (drive
+ids), and the local `exiftool_rs` + `magick-core`/`magick-codecs` crates
+(metadata + thumbnails).

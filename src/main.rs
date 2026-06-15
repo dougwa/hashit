@@ -8,6 +8,15 @@ mod scan;
 mod sync;
 mod watch;
 
+#[cfg(feature = "extract")]
+mod drive;
+#[cfg(feature = "extract")]
+mod extract;
+#[cfg(feature = "extract")]
+mod index;
+#[cfg(feature = "extract")]
+mod store;
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -54,6 +63,18 @@ enum Command {
     Mv(MvArgs),
     /// Remove files/directories (like rm), updating source .hashit manifests.
     Rm(RmArgs),
+    /// Scan, then build/refresh the global metadata index (extract once per hash).
+    #[cfg(feature = "extract")]
+    Index(IndexArgs),
+    /// Query the global metadata index (paginated, filterable).
+    #[cfg(feature = "extract")]
+    Query(QueryArgs),
+    /// Inspect or manage indexed drives (list / detach / relabel).
+    #[cfg(feature = "extract")]
+    Drive(DriveArgs),
+    /// Print the cached thumbnail path for a hash (generating it if missing).
+    #[cfg(feature = "extract")]
+    Thumb(ThumbArgs),
 }
 
 #[derive(Args)]
@@ -107,6 +128,10 @@ struct WatchArgs {
     /// Debounce window in milliseconds for coalescing filesystem events.
     #[arg(long, default_value_t = 500)]
     debounce_ms: u64,
+    /// Also build/refresh the global metadata index as files change.
+    #[cfg(feature = "extract")]
+    #[arg(long)]
+    index: bool,
 }
 
 #[derive(Args)]
@@ -325,6 +350,88 @@ struct InventoryArgs {
     no_scan: bool,
 }
 
+#[cfg(feature = "extract")]
+#[derive(Args)]
+struct IndexArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+    /// Index existing .hashit manifests as-is, without scanning first.
+    #[arg(long)]
+    no_scan: bool,
+    /// Re-extract metadata even for content already in the index.
+    #[arg(long)]
+    reindex: bool,
+}
+
+#[cfg(feature = "extract")]
+#[derive(Args)]
+struct QueryArgs {
+    /// Filter by coarse file type category (e.g. image, video, audio).
+    #[arg(long = "type", value_name = "CATEGORY")]
+    file_type: Option<String>,
+    /// Filter by file extension (e.g. cr2, jpg).
+    #[arg(long)]
+    ext: Option<String>,
+    /// Filter by hash prefix.
+    #[arg(long)]
+    hash: Option<String>,
+    /// Filter to content present on a specific drive id.
+    #[arg(long)]
+    drive: Option<String>,
+    /// Only content with no copy on a currently-online drive.
+    #[arg(long)]
+    offline: bool,
+    /// Filter to content carrying this metadata key.
+    #[arg(long)]
+    key: Option<String>,
+    /// Together with --key, require this value.
+    #[arg(long, requires = "key")]
+    value: Option<String>,
+    /// Max rows to return.
+    #[arg(long, default_value_t = 100)]
+    limit: i64,
+    /// Rows to skip (for pagination).
+    #[arg(long, default_value_t = 0)]
+    offset: i64,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = Format::Json)]
+    format: Format,
+    /// Write to a file instead of stdout.
+    #[arg(long, short)]
+    output: Option<PathBuf>,
+}
+
+#[cfg(feature = "extract")]
+#[derive(Args)]
+struct DriveArgs {
+    #[command(subcommand)]
+    cmd: DriveCmd,
+}
+
+#[cfg(feature = "extract")]
+#[derive(Subcommand)]
+enum DriveCmd {
+    /// List indexed drives and their online/offline status.
+    List,
+    /// Permanently detach a drive: purge its locations and orphaned metadata.
+    Detach {
+        /// Drive id (from `hashit drive list`).
+        drive_id: String,
+    },
+    /// Change a drive's label.
+    Relabel {
+        drive_id: String,
+        label: String,
+    },
+}
+
+#[cfg(feature = "extract")]
+#[derive(Args)]
+struct ThumbArgs {
+    /// Content hash (full, or a unique-enough prefix).
+    hash: String,
+}
+
 fn parse_excludes(globs: &[String]) -> Result<Vec<Pattern>> {
     let mut excludes = Vec::with_capacity(globs.len());
     for g in globs {
@@ -426,7 +533,22 @@ fn run(cli: Cli) -> Result<()> {
         Command::Watch(a) => {
             set_workers(a.common.workers);
             let opts = build_options(&a.common, false)?;
-            watch::watch(&a.common.roots, &opts, a.debounce_ms)
+            #[cfg(feature = "extract")]
+            if a.index {
+                // Seed the index with the current state, then keep it in sync as
+                // the watcher reconciles each changed directory.
+                index::index(&a.common.roots, &opts, false, false)?;
+                let mut indexer = index::Indexer::new()?;
+                let optsref = &opts;
+                return watch::watch(&a.common.roots, &opts, a.debounce_ms, |root, dir| {
+                    if let Err(e) = indexer.reconcile_dir(root, dir, optsref) {
+                        if !optsref.quiet {
+                            eprintln!("hashit: index update failed for {}: {e:#}", dir.display());
+                        }
+                    }
+                });
+            }
+            watch::watch(&a.common.roots, &opts, a.debounce_ms, |_, _| {})
         }
         Command::Dedup(a) => {
             set_workers(a.common.workers);
@@ -509,7 +631,122 @@ fn run(cli: Cli) -> Result<()> {
             };
             fileops::rm(&a.paths, &opts, &scan_opts)
         }
+        #[cfg(feature = "extract")]
+        Command::Index(a) => {
+            set_workers(a.common.workers);
+            let opts = build_options(&a.common, false)?;
+            let stats = index::index(&a.common.roots, &opts, a.no_scan, a.reindex)?;
+            if !a.common.quiet {
+                println!(
+                    "indexed {} files, {} new content extracted, {} thumbnails",
+                    stats.files, stats.new_content, stats.thumbs
+                );
+            }
+            Ok(())
+        }
+        #[cfg(feature = "extract")]
+        Command::Query(a) => {
+            let store = store::Store::open_default()?;
+            // Keep online/offline accurate before reporting it.
+            drive::refresh_presence(&store)?;
+            let filter = store::QueryFilter {
+                file_type: a.file_type,
+                ext: a.ext,
+                hash_prefix: a.hash,
+                drive_id: a.drive,
+                offline_only: a.offline,
+                key: a.key,
+                value: a.value,
+                limit: a.limit,
+                offset: a.offset,
+            };
+            let rows = store.query(&filter)?;
+            write_query(&rows, a.format, a.output.as_deref())?;
+            Ok(())
+        }
+        #[cfg(feature = "extract")]
+        Command::Drive(a) => {
+            let mut store = store::Store::open_default()?;
+            match a.cmd {
+                DriveCmd::List => {
+                    drive::refresh_presence(&store)?;
+                    for d in store.list_drives()? {
+                        println!(
+                            "{}  {:<7}  {} files  label={:?}  {}",
+                            d.drive_id,
+                            if d.online { "online" } else { "offline" },
+                            d.files,
+                            d.label,
+                            d.last_root
+                        );
+                    }
+                }
+                DriveCmd::Detach { drive_id } => {
+                    let n = store.detach_drive(&drive_id)?;
+                    println!("detached {drive_id}: removed {n} locations");
+                }
+                DriveCmd::Relabel { drive_id, label } => {
+                    if !store.relabel_drive(&drive_id, &label)? {
+                        anyhow::bail!("no such drive: {drive_id}");
+                    }
+                }
+            }
+            Ok(())
+        }
+        #[cfg(feature = "extract")]
+        Command::Thumb(a) => {
+            let store = store::Store::open_default()?;
+            match store.thumb_lookup(&a.hash)? {
+                None => anyhow::bail!("no indexed content matching hash {}", a.hash),
+                Some((algo, hash, has_thumb, src)) => {
+                    let dest = store.thumb_path(&algo, &hash);
+                    if !has_thumb || !dest.exists() {
+                        if extract::make_thumb(&src, &dest) {
+                            store.set_has_thumb(&algo, &hash, true)?;
+                        } else {
+                            anyhow::bail!(
+                                "could not generate thumbnail for {hash} (source: {})",
+                                src.display()
+                            );
+                        }
+                    }
+                    println!("{}", dest.display());
+                }
+            }
+            Ok(())
+        }
     }
+}
+
+/// Render query results to stdout or a file (mirrors `inventory::write_inventory`).
+#[cfg(feature = "extract")]
+fn write_query(
+    rows: &[store::QueryRow],
+    format: Format,
+    out: Option<&std::path::Path>,
+) -> Result<()> {
+    use std::io::Write;
+    let mut sink: Box<dyn Write> = match out {
+        Some(p) => {
+            Box::new(std::fs::File::create(p).with_context(|| format!("creating {}", p.display()))?)
+        }
+        None => Box::new(std::io::stdout().lock()),
+    };
+    match format {
+        Format::Json => {
+            let json = serde_json::to_string_pretty(rows).context("serializing query results")?;
+            sink.write_all(json.as_bytes())?;
+            sink.write_all(b"\n")?;
+        }
+        Format::Csv => {
+            let mut wtr = csv::Writer::from_writer(&mut sink);
+            for r in rows {
+                wtr.serialize(r).context("writing csv row")?;
+            }
+            wtr.flush()?;
+        }
+    }
+    Ok(())
 }
 
 fn main() -> ExitCode {

@@ -25,6 +25,17 @@ anyhow = "1"
 csv = "1.3"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 console = "0.15"
+uuid = { version = "1", features = ["v4"], optional = true }
+rusqlite = { version = "0.31", features = ["bundled"], optional = true }
+exiftool_rs = { package = "exiftool-rs", path = "../exiftool/exiftool-rs", optional = true }
+magick-core = { path = "../imagemagick/magick-rs/crates/magick-core", optional = true }
+magick-codecs = { path = "../imagemagick/magick-rs/crates/magick-codecs", optional = true }
+
+[features]
+default = ["extract"]
+# The metadata subsystem: global SQLite index, drive registry, extractors,
+# thumbnails. Gated so the core CLI can build without these heavier deps.
+extract = ["dep:uuid", "dep:rusqlite", "dep:exiftool_rs", "dep:magick-core", "dep:magick-codecs"]
 
 [profile.release]
 opt-level = 3

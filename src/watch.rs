@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -13,7 +13,16 @@ use crate::scan::{is_apple_double, process_dir, scan, ScanOptions, ScanStats};
 /// Run a full scan, then watch every `root` recursively and keep `.hashit`
 /// manifests updated as files are added, changed, or removed. Blocks until
 /// interrupted.
-pub fn watch(roots: &[PathBuf], opts: &ScanOptions, debounce_ms: u64) -> Result<()> {
+///
+/// `on_dir(root, dir)` is invoked after each directory is successfully
+/// reprocessed, letting callers (e.g. the metadata indexer) react to changes.
+/// Pass `|_, _| {}` when no hook is needed.
+pub fn watch(
+    roots: &[PathBuf],
+    opts: &ScanOptions,
+    debounce_ms: u64,
+    mut on_dir: impl FnMut(&Path, &Path),
+) -> Result<()> {
     // Canonicalize so we can reliably compare event paths against the roots.
     let roots: Vec<PathBuf> = roots
         .iter()
@@ -99,6 +108,7 @@ pub fn watch(roots: &[PathBuf], opts: &ScanOptions, debounce_ms: u64) -> Result<
                             if changed && !opts.quiet {
                                 println!("updated {} — {s}", d.display());
                             }
+                            on_dir(root, &d);
                         }
                         Err(e) => {
                             if !opts.quiet {
