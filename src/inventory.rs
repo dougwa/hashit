@@ -157,6 +157,22 @@ pub fn build_inventory(root: &Path, opts: &ScanOptions) -> Result<Vec<InventoryR
     Ok(records)
 }
 
+/// Drop every record whose content hash is unique, keeping only files that
+/// have at least one duplicate elsewhere in the inventory.
+pub fn retain_dups(records: &mut Vec<InventoryRecord>) {
+    use std::collections::HashMap;
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for r in records.iter() {
+        *counts.entry(r.hash.as_str()).or_insert(0) += 1;
+    }
+    let dups: std::collections::HashSet<String> = counts
+        .into_iter()
+        .filter(|(_, n)| *n > 1)
+        .map(|(h, _)| h.to_string())
+        .collect();
+    records.retain(|r| dups.contains(&r.hash));
+}
+
 /// Render the inventory to stdout or a file in the requested format.
 pub fn write_inventory(
     records: &[InventoryRecord],

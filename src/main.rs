@@ -323,6 +323,9 @@ struct InventoryArgs {
     /// Aggregate existing .hashit manifests as-is, without scanning first.
     #[arg(long)]
     no_scan: bool,
+    /// Only report files whose content hash occurs more than once.
+    #[arg(long)]
+    dups_only: bool,
 }
 
 fn parse_excludes(globs: &[String]) -> Result<Vec<Pattern>> {
@@ -420,6 +423,9 @@ fn run(cli: Cli) -> Result<()> {
                 records.extend(inventory::build_inventory(path, &scan_opts)?);
             }
             records.sort_by(|x, y| x.path.cmp(&y.path));
+            if a.dups_only {
+                inventory::retain_dups(&mut records);
+            }
             inventory::write_inventory(&records, a.format, a.output.as_deref())?;
             Ok(())
         }
