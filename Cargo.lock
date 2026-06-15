@@ -586,6 +586,7 @@ dependencies = [
 [[package]]
 name = "exiftool-rs"
 version = "0.1.0"
+source = "git+ssh://git@github.com/dougwa/exiftool-rs.git?rev=dcd8462ea0f74d06df6d07a02072110fb0964044#dcd8462ea0f74d06df6d07a02072110fb0964044"
 
 [[package]]
 name = "exr"
@@ -1173,6 +1174,7 @@ dependencies = [
 [[package]]
 name = "magick-codecs"
 version = "0.0.0"
+source = "git+ssh://git@github.com/dougwa/magick-rs.git?rev=1f79a00557922e15952b2bf9f3ca9fae93f17a40#1f79a00557922e15952b2bf9f3ca9fae93f17a40"
 dependencies = [
  "image",
  "magick-core",
@@ -1183,6 +1185,7 @@ dependencies = [
 [[package]]
 name = "magick-core"
 version = "0.0.0"
+source = "git+ssh://git@github.com/dougwa/magick-rs.git?rev=1f79a00557922e15952b2bf9f3ca9fae93f17a40#1f79a00557922e15952b2bf9f3ca9fae93f17a40"
 dependencies = [
  "cosmic-text",
  "rayon",

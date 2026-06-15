@@ -27,9 +27,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 console = "0.15"
 uuid = { version = "1", features = ["v4"], optional = true }
 rusqlite = { version = "0.31", features = ["bundled"], optional = true }
-exiftool_rs = { package = "exiftool-rs", path = "../exiftool/exiftool-rs", optional = true }
-magick-core = { path = "../imagemagick/magick-rs/crates/magick-core", optional = true }
-magick-codecs = { path = "../imagemagick/magick-rs/crates/magick-codecs", optional = true }
+exiftool_rs = { package = "exiftool-rs", git = "ssh://git@github.com/dougwa/exiftool-rs.git", rev = "dcd8462ea0f74d06df6d07a02072110fb0964044", optional = true }
+magick-core = { git = "ssh://git@github.com/dougwa/magick-rs.git", rev = "1f79a00557922e15952b2bf9f3ca9fae93f17a40", optional = true }
+magick-codecs = { git = "ssh://git@github.com/dougwa/magick-rs.git", rev = "1f79a00557922e15952b2bf9f3ca9fae93f17a40", optional = true }
 
 [features]
 default = ["extract"]
