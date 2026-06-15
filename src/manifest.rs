@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -73,9 +74,25 @@ impl Manifest {
     /// Write the manifest to `dir/.hashit` atomically (temp file + rename).
     pub fn save(&self, dir: &Path) -> Result<()> {
         let path = dir.join(MANIFEST_NAME);
-        let tmp = dir.join(format!("{MANIFEST_TMP_PREFIX}{}", std::process::id()));
+        // Include the thread id so two workers saving into the same directory
+        // never collide on the temp filename (pid alone isn't unique per-writer).
+        let tmp = dir.join(format!(
+            "{MANIFEST_TMP_PREFIX}{}.{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let json = serde_json::to_vec_pretty(self).context("serializing manifest")?;
-        fs::write(&tmp, &json).with_context(|| format!("writing {}", tmp.display()))?;
+        // fsync the temp file before renaming so a crash or unclean unmount
+        // (e.g. yanking an external drive) can't leave a truncated/zero-length
+        // .hashit: the rename is atomic, but only durable if the data landed first.
+        {
+            let mut f =
+                fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+            f.write_all(&json)
+                .with_context(|| format!("writing {}", tmp.display()))?;
+            f.sync_all()
+                .with_context(|| format!("flushing {}", tmp.display()))?;
+        }
         fs::rename(&tmp, &path).with_context(|| format!("renaming into {}", path.display()))?;
         Ok(())
     }
