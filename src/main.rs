@@ -75,6 +75,24 @@ enum Command {
     /// Print the cached thumbnail path for a hash (generating it if missing).
     #[cfg(feature = "extract")]
     Thumb(ThumbArgs),
+    /// Add, remove, or list user tags on indexed content (by hash).
+    #[cfg(feature = "extract")]
+    Tag(TagArgs),
+    /// Mark a hash as a favorite (shorthand for the "favorite" tag).
+    #[cfg(feature = "extract")]
+    Fav(FavArgs),
+    /// Remove the favorite mark from a hash.
+    #[cfg(feature = "extract")]
+    Unfav(FavArgs),
+    /// Logically link two or more hashes (e.g. a JPG + its RAW).
+    #[cfg(feature = "extract")]
+    Link(LinkArgs),
+    /// Remove a hash from its link group.
+    #[cfg(feature = "extract")]
+    Unlink(FavArgs),
+    /// Show the link group a hash belongs to.
+    #[cfg(feature = "extract")]
+    Links(FavArgs),
 }
 
 #[derive(Args)]
@@ -387,6 +405,12 @@ struct QueryArgs {
     /// Together with --key, require this value.
     #[arg(long, requires = "key")]
     value: Option<String>,
+    /// Filter to content carrying this user tag.
+    #[arg(long)]
+    tag: Option<String>,
+    /// Only favorites.
+    #[arg(long)]
+    favorite: bool,
     /// Max rows to return.
     #[arg(long, default_value_t = 100)]
     limit: i64,
@@ -430,6 +454,52 @@ enum DriveCmd {
 struct ThumbArgs {
     /// Content hash (full, or a unique-enough prefix).
     hash: String,
+}
+
+/// A single hash argument, shared by fav/unfav/unlink/links.
+#[cfg(feature = "extract")]
+#[derive(Args)]
+struct FavArgs {
+    /// Content hash (full, or a unique-enough prefix).
+    hash: String,
+}
+
+#[cfg(feature = "extract")]
+#[derive(Args)]
+struct TagArgs {
+    #[command(subcommand)]
+    cmd: TagCmd,
+}
+
+#[cfg(feature = "extract")]
+#[derive(Subcommand)]
+enum TagCmd {
+    /// Add one or more tags to a hash.
+    Add {
+        hash: String,
+        #[arg(required = true, num_args = 1.., value_name = "TAG")]
+        tags: Vec<String>,
+    },
+    /// Remove one or more tags from a hash.
+    Rm {
+        hash: String,
+        #[arg(required = true, num_args = 1.., value_name = "TAG")]
+        tags: Vec<String>,
+    },
+    /// List the tags on a hash.
+    Ls { hash: String },
+}
+
+#[cfg(feature = "extract")]
+#[derive(Args)]
+struct LinkArgs {
+    /// Two or more hashes to link (omit when using --auto).
+    #[arg(num_args = 0.., value_name = "HASH")]
+    hashes: Vec<String>,
+    /// Auto-link files sharing a basename but differing in extension
+    /// (e.g. IMG_0001.JPG + IMG_0001.CR2) under the given path(s).
+    #[arg(long, value_name = "PATH", num_args = 1..)]
+    auto: Vec<PathBuf>,
 }
 
 fn parse_excludes(globs: &[String]) -> Result<Vec<Pattern>> {
@@ -657,6 +727,8 @@ fn run(cli: Cli) -> Result<()> {
                 offline_only: a.offline,
                 key: a.key,
                 value: a.value,
+                tag: a.tag,
+                favorite: a.favorite,
                 limit: a.limit,
                 offset: a.offset,
             };
@@ -715,7 +787,124 @@ fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
+        #[cfg(feature = "extract")]
+        Command::Tag(a) => {
+            let store = store::Store::open_default()?;
+            match a.cmd {
+                TagCmd::Add { hash, tags } => {
+                    let (algo, h) = store.resolve_hash(&hash)?;
+                    for t in &tags {
+                        store.add_tag(&algo, &h, t)?;
+                    }
+                    println!("{h}: tags = {}", store.list_tags(&algo, &h)?.join(", "));
+                }
+                TagCmd::Rm { hash, tags } => {
+                    let (algo, h) = store.resolve_hash(&hash)?;
+                    for t in &tags {
+                        store.remove_tag(&algo, &h, t)?;
+                    }
+                    println!("{h}: tags = {}", store.list_tags(&algo, &h)?.join(", "));
+                }
+                TagCmd::Ls { hash } => {
+                    let (algo, h) = store.resolve_hash(&hash)?;
+                    println!("{}", store.list_tags(&algo, &h)?.join("\n"));
+                }
+            }
+            Ok(())
+        }
+        #[cfg(feature = "extract")]
+        Command::Fav(a) => {
+            let store = store::Store::open_default()?;
+            let (algo, h) = store.resolve_hash(&a.hash)?;
+            store.add_tag(&algo, &h, store::FAVORITE_TAG)?;
+            println!("favorited {h}");
+            Ok(())
+        }
+        #[cfg(feature = "extract")]
+        Command::Unfav(a) => {
+            let store = store::Store::open_default()?;
+            let (algo, h) = store.resolve_hash(&a.hash)?;
+            store.remove_tag(&algo, &h, store::FAVORITE_TAG)?;
+            println!("unfavorited {h}");
+            Ok(())
+        }
+        #[cfg(feature = "extract")]
+        Command::Link(a) => {
+            let mut store = store::Store::open_default()?;
+            // Resolve explicit hashes, plus any auto-detected sidecar pairs.
+            let mut groups: Vec<Vec<(String, String)>> = Vec::new();
+            if !a.hashes.is_empty() {
+                let mut members = Vec::new();
+                for h in &a.hashes {
+                    members.push(store.resolve_hash(h)?);
+                }
+                groups.push(members);
+            }
+            if !a.auto.is_empty() {
+                groups.extend(index::auto_link_groups(&a.auto)?);
+            }
+            if groups.is_empty() {
+                anyhow::bail!("provide two or more hashes, or --auto <path>");
+            }
+            let mut linked = 0usize;
+            for members in groups {
+                if members.len() < 2 {
+                    continue;
+                }
+                let g = store.link_hashes(&members)?;
+                linked += 1;
+                if a.hashes.is_empty() {
+                    // auto mode: report each pair
+                    println!(
+                        "linked {} ({})",
+                        g,
+                        members
+                            .iter()
+                            .map(|(_, h)| short(h))
+                            .collect::<Vec<_>>()
+                            .join(" + ")
+                    );
+                }
+            }
+            if !a.hashes.is_empty() {
+                println!("linked {linked} group(s)");
+            } else {
+                println!("{linked} link group(s) created/updated");
+            }
+            Ok(())
+        }
+        #[cfg(feature = "extract")]
+        Command::Unlink(a) => {
+            let mut store = store::Store::open_default()?;
+            let (algo, h) = store.resolve_hash(&a.hash)?;
+            if store.unlink_hash(&algo, &h)? {
+                println!("unlinked {h}");
+            } else {
+                println!("{h} was not linked");
+            }
+            Ok(())
+        }
+        #[cfg(feature = "extract")]
+        Command::Links(a) => {
+            let store = store::Store::open_default()?;
+            let (algo, h) = store.resolve_hash(&a.hash)?;
+            let members = store.list_group(&algo, &h)?;
+            if members.is_empty() {
+                println!("{h} is not linked");
+            } else {
+                for (_, m) in members {
+                    println!("{m}");
+                }
+            }
+            Ok(())
+        }
     }
+}
+
+/// Short hash form for display.
+#[cfg(feature = "extract")]
+fn short(hash: &str) -> &str {
+    &hash[..hash.len().min(12)]
 }
 
 /// Render query results to stdout or a file (mirrors `inventory::write_inventory`).
