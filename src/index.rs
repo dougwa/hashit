@@ -131,6 +131,69 @@ fn index_root(
     Ok(stats)
 }
 
+/// Detect sidecar groups under `paths`: files in the same directory that share a
+/// basename (stem) but differ in extension — e.g. `IMG_0001.JPG` + `IMG_0001.CR2`.
+/// Returns each group's distinct `(algo, hash)` members (only groups of 2+).
+pub fn auto_link_groups(paths: &[PathBuf]) -> Result<Vec<Vec<(String, String)>>> {
+    use std::collections::{BTreeMap, HashSet};
+    // Minimal scan options: we only read existing manifests.
+    let opts = ScanOptions {
+        algo: crate::hash::HashAlgo::Blake3,
+        follow_symlinks: false,
+        excludes: Vec::new(),
+        ignores: Vec::new(),
+        quiet: true,
+        verbose: false,
+        status: false,
+        skip_apple_double: true,
+        dry_run: false,
+    };
+    // (dir, lowercased stem) -> [(ext, algo, hash)]
+    type StemEntry = (String, String, String);
+    let mut by_stem: BTreeMap<(String, String), Vec<StemEntry>> = BTreeMap::new();
+    for p in paths {
+        for r in build_inventory(p, &opts)? {
+            let path = Path::new(&r.path);
+            let dir = path
+                .parent()
+                .map(|d| d.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let stem = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default();
+            let ext = path
+                .extension()
+                .map(|e| e.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default();
+            by_stem
+                .entry((dir, stem))
+                .or_default()
+                .push((ext, r.algo, r.hash));
+        }
+    }
+    let mut groups = Vec::new();
+    for (_, members) in by_stem {
+        let exts: HashSet<&String> = members.iter().map(|(e, _, _)| e).collect();
+        // Need at least two files differing in extension (a JPG + RAW pair),
+        // not just duplicate copies of one file.
+        if members.len() < 2 || exts.len() < 2 {
+            continue;
+        }
+        let mut seen = HashSet::new();
+        let mut hs = Vec::new();
+        for (_, algo, hash) in members {
+            if seen.insert((algo.clone(), hash.clone())) {
+                hs.push((algo, hash));
+            }
+        }
+        if hs.len() >= 2 {
+            groups.push(hs);
+        }
+    }
+    Ok(groups)
+}
+
 /// Forward-slash relative path, matching the form used in `locations.path`.
 fn to_slash(p: &Path) -> String {
     use std::path::Component;

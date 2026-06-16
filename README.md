@@ -187,9 +187,10 @@ hashit query [--type CATEGORY] [--ext EXT] [--hash PREFIX] [--drive ID]
 
 Paginated, server-side queries grouped by content hash. Filter by coarse type
 (`--type image`), extension (`--ext cr2`), hash prefix, drive, presence
-(`--offline` = no copy on a currently-online drive), or a metadata key/value
-(`--key Model --value "Canon EOS R5"`). Reads only a page at a time, so it scales
-to very large indexes.
+(`--offline` = no copy on a currently-online drive), a metadata key/value
+(`--key Model --value "Canon EOS R5"`), a user tag (`--tag sunset`), or favorites
+(`--favorite`). Each row includes its tags and link group. Reads only a page at a
+time, so it scales to very large indexes.
 
 ### drive — manage indexed drives
 
@@ -204,6 +205,35 @@ hashit drive relabel <drive-id> <name>
 ```sh
 hashit thumb <hash-or-prefix>          # prints the cached thumbnail path (generating it if missing)
 ```
+
+### tag / fav — custom tags and favorites
+
+```sh
+hashit tag add <hash> <tag>...         # attach one or more tags
+hashit tag rm  <hash> <tag>...         # remove tags
+hashit tag ls  <hash>                  # list a hash's tags
+hashit fav <hash>                      # mark a favorite (the "favorite" tag)
+hashit unfav <hash>
+```
+
+Tags are stored in the index **by content hash**, so they apply to every copy of
+that content across all drives, and survive moves. (Tags live only in the index;
+they are not written back into the original files.) Filter with
+`hashit query --tag <tag>` or `--favorite`.
+
+### link — logically group related files
+
+```sh
+hashit link <hash> <hash>...           # link two or more hashes (e.g. a JPG + its RAW)
+hashit link --auto <path>...           # auto-link sidecars: same basename, different extension
+hashit links <hash>                    # show a hash's link group
+hashit unlink <hash>                   # remove a hash from its group
+```
+
+Links are also keyed by content hash. `--auto` pairs files in the same directory
+that share a basename but differ in extension (e.g. `IMG_0001.JPG` +
+`IMG_0001.CR2`). Linking sets that overlap are merged into one group; removing a
+member that would leave a single file dissolves the group.
 
 `watch` also accepts `--index` to keep the index in sync with live filesystem
 changes as it updates manifests.

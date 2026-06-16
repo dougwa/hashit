@@ -18,6 +18,9 @@ use crate::manifest::now_rfc3339;
 /// Bump when the schema changes incompatibly.
 const SCHEMA_VERSION: i64 = 1;
 
+/// The reserved tag used to mark favorites.
+pub const FAVORITE_TAG: &str = "favorite";
+
 /// One flattened metadata tag (EAV row).
 pub struct MetaTag {
     pub group: String,
@@ -59,6 +62,10 @@ pub struct QueryFilter {
     pub offline_only: bool,
     pub key: Option<String>,
     pub value: Option<String>,
+    /// Only content carrying this user tag.
+    pub tag: Option<String>,
+    /// Only favorites (sugar for `tag = FAVORITE_TAG`).
+    pub favorite: bool,
     pub limit: i64,
     pub offset: i64,
 }
@@ -80,6 +87,10 @@ pub struct QueryRow {
     pub drives: String,
     /// A representative path (lexicographically smallest).
     pub sample_path: String,
+    /// Comma-separated user tags on this hash.
+    pub tags: String,
+    /// Link group id, if this hash is linked to others.
+    pub link_group: Option<String>,
 }
 
 pub struct Store {
@@ -164,11 +175,29 @@ impl Store {
                 PRIMARY KEY (algo, hash, drive_id, path)
             );
 
+            CREATE TABLE IF NOT EXISTS tags (
+                algo     TEXT NOT NULL,
+                hash     TEXT NOT NULL,
+                tag      TEXT NOT NULL,
+                added_at TEXT NOT NULL,
+                PRIMARY KEY (algo, hash, tag)
+            );
+
+            CREATE TABLE IF NOT EXISTS link_members (
+                group_id TEXT NOT NULL,
+                algo     TEXT NOT NULL,
+                hash     TEXT NOT NULL,
+                added_at TEXT NOT NULL,
+                PRIMARY KEY (algo, hash)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_loc_drive ON locations (drive_id);
             CREATE INDEX IF NOT EXISTS idx_loc_hash  ON locations (algo, hash);
             CREATE INDEX IF NOT EXISTS idx_content_type ON content (file_type);
             CREATE INDEX IF NOT EXISTS idx_content_ext  ON content (ext);
             CREATE INDEX IF NOT EXISTS idx_meta_kv ON metadata (key, value);
+            CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags (tag);
+            CREATE INDEX IF NOT EXISTS idx_link_group ON link_members (group_id);
             "#,
         )?;
         self.conn.execute(
@@ -403,7 +432,154 @@ impl Store {
         Ok(n as i64)
     }
 
-    /// Resolve a hash (full or unique-ish prefix) to a source for thumbnailing:
+    // -- tags ---------------------------------------------------------------
+
+    /// Resolve a hash (full or prefix) to a single indexed `(algo, hash)`.
+    /// Errors if nothing matches or the prefix is ambiguous.
+    pub fn resolve_hash(&self, prefix: &str) -> Result<(String, String)> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT algo, hash FROM content WHERE hash LIKE ?1 LIMIT 2")?;
+        let rows = stmt
+            .query_map(params![format!("{prefix}%")], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        match rows.len() {
+            0 => anyhow::bail!("no indexed content matching hash {prefix}"),
+            1 => Ok(rows.into_iter().next().unwrap()),
+            _ => anyhow::bail!("hash prefix {prefix} is ambiguous"),
+        }
+    }
+
+    /// Attach a tag to a content hash. Returns false if it was already present.
+    pub fn add_tag(&self, algo: &str, hash: &str, tag: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "INSERT OR IGNORE INTO tags (algo, hash, tag, added_at) VALUES (?1, ?2, ?3, ?4)",
+            params![algo, hash, tag, now_rfc3339()],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Remove a tag from a content hash. Returns false if it wasn't present.
+    pub fn remove_tag(&self, algo: &str, hash: &str, tag: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "DELETE FROM tags WHERE algo = ?1 AND hash = ?2 AND tag = ?3",
+            params![algo, hash, tag],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// All tags on a content hash, sorted.
+    pub fn list_tags(&self, algo: &str, hash: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT tag FROM tags WHERE algo = ?1 AND hash = ?2 ORDER BY tag")?;
+        let rows = stmt
+            .query_map(params![algo, hash], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    // -- links --------------------------------------------------------------
+
+    /// Link a set of hashes into one group (e.g. a JPG + its RAW). If any are
+    /// already linked, their groups are merged. Returns the resulting group id.
+    pub fn link_hashes(&mut self, members: &[(String, String)]) -> Result<String> {
+        let tx = self.conn.transaction()?;
+        // Existing groups touched by these members.
+        let mut groups: Vec<String> = Vec::new();
+        for (algo, hash) in members {
+            let g: Option<String> = tx
+                .query_row(
+                    "SELECT group_id FROM link_members WHERE algo = ?1 AND hash = ?2",
+                    params![algo, hash],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(g) = g {
+                if !groups.contains(&g) {
+                    groups.push(g);
+                }
+            }
+        }
+        let target = groups
+            .first()
+            .cloned()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        // Merge any other existing groups into the target.
+        for g in groups.iter().skip(1) {
+            tx.execute(
+                "UPDATE link_members SET group_id = ?1 WHERE group_id = ?2",
+                params![target, g],
+            )?;
+        }
+        let now = now_rfc3339();
+        for (algo, hash) in members {
+            tx.execute(
+                "INSERT OR IGNORE INTO link_members (group_id, algo, hash, added_at) VALUES (?1,?2,?3,?4)",
+                params![target, algo, hash, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(target)
+    }
+
+    /// Remove a hash from its link group. If only one member would remain, the
+    /// group is dissolved (a link needs at least two members). Returns whether
+    /// the hash was linked.
+    pub fn unlink_hash(&mut self, algo: &str, hash: &str) -> Result<bool> {
+        let tx = self.conn.transaction()?;
+        let group: Option<String> = tx
+            .query_row(
+                "SELECT group_id FROM link_members WHERE algo = ?1 AND hash = ?2",
+                params![algo, hash],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(group) = group else {
+            return Ok(false);
+        };
+        tx.execute(
+            "DELETE FROM link_members WHERE algo = ?1 AND hash = ?2",
+            params![algo, hash],
+        )?;
+        let remaining: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM link_members WHERE group_id = ?1",
+            params![group],
+            |r| r.get(0),
+        )?;
+        if remaining < 2 {
+            tx.execute(
+                "DELETE FROM link_members WHERE group_id = ?1",
+                params![group],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// The members of the link group containing `(algo, hash)`, sorted by hash
+    /// (empty if the hash is not linked).
+    pub fn list_group(&self, algo: &str, hash: &str) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT m2.algo, m2.hash
+            FROM link_members m1
+            JOIN link_members m2 ON m1.group_id = m2.group_id
+            WHERE m1.algo = ?1 AND m1.hash = ?2
+            ORDER BY m2.hash
+            "#,
+        )?;
+        let rows = stmt
+            .query_map(params![algo, hash], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Resolve a hash (full or prefix) to a source for thumbnailing:
     /// `(algo, hash, has_thumb, absolute source path)`. Prefers online drives.
     pub fn thumb_lookup(
         &self,
@@ -479,6 +655,18 @@ impl Store {
             );
             args.push(Box::new(d.clone()));
         }
+        // A specific tag, or the favorite tag via the `favorite` flag.
+        let tag_filter = f
+            .tag
+            .clone()
+            .or_else(|| f.favorite.then(|| FAVORITE_TAG.to_string()));
+        if let Some(t) = tag_filter {
+            where_sql.push(
+                "EXISTS (SELECT 1 FROM tags t WHERE t.algo=c.algo AND t.hash=c.hash AND t.tag=?)"
+                    .into(),
+            );
+            args.push(Box::new(t));
+        }
         if f.offline_only {
             // No location on any currently-online, non-detached drive.
             where_sql.push(
@@ -501,7 +689,9 @@ impl Store {
                    (SELECT MIN(l.path) FROM locations l WHERE l.algo=c.algo AND l.hash=c.hash),
                    (SELECT IFNULL(GROUP_CONCAT(DISTINCT l.drive_id),'') FROM locations l WHERE l.algo=c.algo AND l.hash=c.hash),
                    EXISTS (SELECT 1 FROM locations l JOIN drives dr ON dr.drive_id=l.drive_id
-                           WHERE l.algo=c.algo AND l.hash=c.hash AND dr.online=1 AND dr.detached=0)
+                           WHERE l.algo=c.algo AND l.hash=c.hash AND dr.online=1 AND dr.detached=0),
+                   (SELECT IFNULL(GROUP_CONCAT(t.tag),'') FROM tags t WHERE t.algo=c.algo AND t.hash=c.hash),
+                   (SELECT lm.group_id FROM link_members lm WHERE lm.algo=c.algo AND lm.hash=c.hash)
             FROM content c
             {where_clause}
             ORDER BY c.hash
@@ -526,6 +716,8 @@ impl Store {
                     sample_path: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
                     drives: r.get(8)?,
                     online: r.get::<_, i64>(9)? != 0,
+                    tags: r.get(10)?,
+                    link_group: r.get(11)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

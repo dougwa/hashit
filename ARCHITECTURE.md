@@ -98,9 +98,11 @@ index for rich metadata, keyed by content hash rather than path.
   (`$HASHIT_HOME` overrides; WAL + a `schema_meta` version row for migrations)
   with a sibling `cache/` for thumbnails. Tables: `drives`, `content` (one row
   per `(algo, hash)`), `metadata` (EAV: `key`/`value`, indexed for reverse
-  lookups), and `locations` (one row per `(algo, hash, drive, path)`). The DB is
-  rebuildable from the `.hashit` manifests, so corruption is recovered by
-  re-indexing.
+  lookups), `locations` (one row per `(algo, hash, drive, path)`), `tags`
+  (user tags/favorites, keyed by hash), and `link_members` (hash → link group).
+  Everything except user tags/links is rebuildable from the `.hashit` manifests,
+  so corruption is recovered by re-indexing; tags and links are user-authored
+  state and key by content hash, so they apply to every copy.
 - **Drives (`drive.rs`)** — each root carries a `.hashit-drive` marker (a UUID +
   label, written atomically like a manifest). The UUID is the stable `drive_id`;
   it travels with the drive (works on exFAT, unlike volume UUIDs). Presence is
@@ -117,6 +119,13 @@ index for rich metadata, keyed by content hash rather than path.
   upserted; stale locations on the drive are pruned. `Indexer::reconcile_dir`
   does the same for a single directory and is driven by `watch --index` via a
   callback, so live filesystem activity updates the index incrementally.
+
+- **Tags & links (`store.rs`, CLI in `main.rs`)** — `tag`/`fav` attach
+  hash-keyed user tags (favorites are the reserved `favorite` tag); `link` groups
+  related hashes (e.g. a JPG + its RAW), with `link --auto` detecting same-stem,
+  different-extension sidecars via `index::auto_link_groups`. Linking overlapping
+  sets merges their groups; unlinking down to one member dissolves the group.
+  Both are index-only (never written back to the original files).
 
 The core `scan`/manifest path is untouched by all of this — the index is
 additive and entirely behind the `extract` feature, which also gates its heavier
