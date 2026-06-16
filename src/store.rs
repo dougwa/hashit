@@ -135,6 +135,16 @@ impl DirEntry {
     }
 }
 
+/// A location joined with its drive's root + online state, for resolving an
+/// absolute path.
+#[cfg(feature = "serve")]
+pub struct ResolvedLoc {
+    pub drive_id: String,
+    pub path: String,
+    pub last_root: String,
+    pub online: bool,
+}
+
 /// One place a content hash is found.
 #[cfg(feature = "serve")]
 #[derive(Debug, Serialize)]
@@ -502,6 +512,48 @@ impl Store {
             params![algo, hash, drive_id, path, mtime_ns as i64, seen_at],
         )?;
         Ok(())
+    }
+
+    /// Remove a single (drive, path) location for a hash (used after the API
+    /// dedup endpoint deletes a duplicate file).
+    #[cfg(feature = "serve")]
+    pub fn remove_location(
+        &self,
+        algo: &str,
+        hash: &str,
+        drive_id: &str,
+        path: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM locations WHERE algo=?1 AND hash=?2 AND drive_id=?3 AND path=?4",
+            params![algo, hash, drive_id, path],
+        )?;
+        Ok(())
+    }
+
+    /// Every location of a hash, joined with its drive's root and online state,
+    /// so callers can build absolute paths and skip offline copies.
+    #[cfg(feature = "serve")]
+    pub fn locations_for(&self, algo: &str, hash: &str) -> Result<Vec<ResolvedLoc>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT l.drive_id, l.path, dr.last_root, dr.online
+            FROM locations l JOIN drives dr ON dr.drive_id = l.drive_id
+            WHERE l.algo=?1 AND l.hash=?2 AND dr.detached=0
+            ORDER BY l.drive_id, l.path
+            "#,
+        )?;
+        let rows = stmt
+            .query_map(params![algo, hash], |r| {
+                Ok(ResolvedLoc {
+                    drive_id: r.get(0)?,
+                    path: r.get(1)?,
+                    last_root: r.get(2)?,
+                    online: r.get::<_, i64>(3)? != 0,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// Drop a drive's locations not refreshed since `since` (files that vanished

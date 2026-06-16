@@ -151,6 +151,12 @@ hashit ships no UI; an external web app is meant to be built on top.
   (`path >= prefix AND path < prefix‖+1`) plus SQL `substr`/`instr` to compute
   immediate children — no full-subtree materialization.
 
+  Mutating endpoints (tag/favorite, link/unlink, and dedup "keep this") are
+  opt-in via `--allow-write` (else `403`) and route through the same `api.rs`
+  ops, reusing `dedup::remove_one` + `scan::process_dir` so deletions update the
+  `.hashit` manifests and the index together; the dedup call requires an explicit
+  `confirm` and skips offline copies.
+
 The `serve` feature implies `extract` and adds the async HTTP stack
 (`tokio`, `axum`, `tower-http`); the default build does not include it.
 

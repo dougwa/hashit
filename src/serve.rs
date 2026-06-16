@@ -18,7 +18,7 @@ use axum::{
     http::{header, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Json, Response},
-    routing::get,
+    routing::{delete, get, post},
     Router,
 };
 use serde::Deserialize;
@@ -28,15 +28,22 @@ use tower_http::cors::{Any, CorsLayer};
 use crate::api;
 use crate::store::{QueryFilter, Store};
 
+/// Shared server state.
+#[derive(Clone)]
+struct AppState {
+    token: Arc<Option<String>>,
+    allow_write: bool,
+}
+
 /// Run the API server, blocking until shutdown. Builds its own tokio runtime so
 /// the rest of hashit can stay synchronous.
-pub fn run(host: &str, port: u16, token: Option<String>) -> Result<()> {
+pub fn run(host: &str, port: u16, token: Option<String>, allow_write: bool) -> Result<()> {
     let ip: IpAddr = host.parse().with_context_host(host)?;
     let addr = SocketAddr::new(ip, port);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(serve(addr, token))
+    rt.block_on(serve(addr, token, allow_write))
 }
 
 /// Tiny helper so `host.parse()` yields a useful error message.
@@ -49,8 +56,11 @@ impl<T, E: std::fmt::Display> HostCtx<T> for std::result::Result<T, E> {
     }
 }
 
-async fn serve(addr: SocketAddr, token: Option<String>) -> Result<()> {
-    let token = Arc::new(token);
+async fn serve(addr: SocketAddr, token: Option<String>, allow_write: bool) -> Result<()> {
+    let state = AppState {
+        token: Arc::new(token),
+        allow_write,
+    };
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
@@ -63,16 +73,32 @@ async fn serve(addr: SocketAddr, token: Option<String>) -> Result<()> {
         .route("/v1/content/:hash", get(content))
         .route("/v1/content/:hash/meta", get(detail))
         .route("/v1/thumb/:hash", get(thumb))
-        .layer(middleware::from_fn_with_state(token.clone(), auth))
-        .layer(cors);
+        // Mutations (gated by --allow-write inside each handler).
+        .route("/v1/content/:hash/tags", post(add_tags))
+        .route("/v1/content/:hash/tags/:tag", delete(remove_tag))
+        .route("/v1/content/:hash/favorite", post(add_favorite).delete(remove_favorite))
+        .route("/v1/links", post(link))
+        .route("/v1/links/:hash", delete(unlink))
+        .route("/v1/content/:hash/dedup", post(dedup))
+        .layer(middleware::from_fn_with_state(state.clone(), auth))
+        .layer(cors)
+        .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
     eprintln!("hashit api listening on http://{bound}");
-    match token.as_ref() {
+    match state.token.as_ref() {
         Some(t) => eprintln!("auth: send `Authorization: Bearer {t}` or `?token={t}`"),
         None => eprintln!("auth: disabled (--no-token)"),
     }
+    eprintln!(
+        "writes: {}",
+        if allow_write {
+            "enabled (--allow-write)"
+        } else {
+            "disabled (read-only)"
+        }
+    );
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -81,8 +107,8 @@ async fn serve(addr: SocketAddr, token: Option<String>) -> Result<()> {
 
 /// Reject requests lacking the bearer token (header or `?token=`), unless no
 /// token is configured.
-async fn auth(State(token): State<Arc<Option<String>>>, req: Request, next: Next) -> Response {
-    let Some(expected) = token.as_ref() else {
+async fn auth(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let Some(expected) = state.token.as_ref() else {
         return next.run(req).await;
     };
     let from_header = req
@@ -135,6 +161,36 @@ where
     .await
     .map_err(|e| AppError(anyhow::anyhow!("task join error: {e}")))?
     .map_err(AppError)
+}
+
+/// Like [`db`], but with a mutable store (for write operations).
+async fn db_mut<T, F>(f: F) -> Result<T, AppError>
+where
+    F: FnOnce(&mut Store) -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let mut store = Store::open_default()?;
+        f(&mut store)
+    })
+    .await
+    .map_err(|e| AppError(anyhow::anyhow!("task join error: {e}")))?
+    .map_err(AppError)
+}
+
+/// `Some(403)` unless the server was started with `--allow-write`.
+fn write_blocked(state: &AppState) -> Option<Response> {
+    if state.allow_write {
+        None
+    } else {
+        Some(
+            (
+                StatusCode::FORBIDDEN,
+                "writes are disabled; start the server with --allow-write",
+            )
+                .into_response(),
+        )
+    }
 }
 
 // -- handlers --------------------------------------------------------------
@@ -222,6 +278,113 @@ async fn thumb(Path(hash): Path<String>) -> Result<Response, AppError> {
         return Ok(not_found());
     };
     serve_file(&path, "image/jpeg").await
+}
+
+// -- mutation handlers (require --allow-write) ------------------------------
+
+#[derive(Deserialize)]
+struct TagsBody {
+    tags: Vec<String>,
+}
+
+async fn add_tags(
+    State(state): State<AppState>,
+    Path(hash): Path<String>,
+    Json(body): Json<TagsBody>,
+) -> Result<Response, AppError> {
+    if let Some(r) = write_blocked(&state) {
+        return Ok(r);
+    }
+    let tags = db_mut(move |s| api::add_tags(s, &hash, &body.tags)).await?;
+    Ok(Json(tags).into_response())
+}
+
+async fn remove_tag(
+    State(state): State<AppState>,
+    Path((hash, tag)): Path<(String, String)>,
+) -> Result<Response, AppError> {
+    if let Some(r) = write_blocked(&state) {
+        return Ok(r);
+    }
+    let tags = db_mut(move |s| api::remove_tag(s, &hash, &tag)).await?;
+    Ok(Json(tags).into_response())
+}
+
+async fn add_favorite(
+    State(state): State<AppState>,
+    Path(hash): Path<String>,
+) -> Result<Response, AppError> {
+    if let Some(r) = write_blocked(&state) {
+        return Ok(r);
+    }
+    db_mut(move |s| api::set_favorite(s, &hash, true)).await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn remove_favorite(
+    State(state): State<AppState>,
+    Path(hash): Path<String>,
+) -> Result<Response, AppError> {
+    if let Some(r) = write_blocked(&state) {
+        return Ok(r);
+    }
+    db_mut(move |s| api::set_favorite(s, &hash, false)).await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+#[derive(Deserialize)]
+struct LinkBody {
+    hashes: Vec<String>,
+}
+
+async fn link(
+    State(state): State<AppState>,
+    Json(body): Json<LinkBody>,
+) -> Result<Response, AppError> {
+    if let Some(r) = write_blocked(&state) {
+        return Ok(r);
+    }
+    let group = db_mut(move |s| api::link(s, &body.hashes)).await?;
+    Ok(Json(serde_json::json!({ "group": group })).into_response())
+}
+
+async fn unlink(
+    State(state): State<AppState>,
+    Path(hash): Path<String>,
+) -> Result<Response, AppError> {
+    if let Some(r) = write_blocked(&state) {
+        return Ok(r);
+    }
+    let unlinked = db_mut(move |s| api::unlink(s, &hash)).await?;
+    Ok(Json(serde_json::json!({ "unlinked": unlinked })).into_response())
+}
+
+#[derive(Deserialize)]
+struct DedupBody {
+    keep_drive: String,
+    keep_path: String,
+    #[serde(default)]
+    confirm: bool,
+}
+
+async fn dedup(
+    State(state): State<AppState>,
+    Path(hash): Path<String>,
+    Json(body): Json<DedupBody>,
+) -> Result<Response, AppError> {
+    if let Some(r) = write_blocked(&state) {
+        return Ok(r);
+    }
+    if !body.confirm {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            "dedup deletes files; resend with {\"confirm\": true}",
+        )
+            .into_response());
+    }
+    let outcome =
+        db_mut(move |s| api::dedup_keep(s, &hash, &body.keep_drive, &body.keep_path)).await?;
+    Ok(Json(outcome).into_response())
 }
 
 /// Stream a file from disk with the given content type (no buffering it all

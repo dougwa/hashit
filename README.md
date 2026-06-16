@@ -253,14 +253,15 @@ filesystem over your drives. hashit ships **no UI**; build a web app (any
 framework) on top of this API.
 
 ```sh
-hashit serve [--host 127.0.0.1] [--port 8087] [--token TOKEN | --no-token]
+hashit serve [--host 127.0.0.1] [--port 8087] [--token TOKEN | --no-token] [--allow-write]
 ```
 
 Binds to localhost by default and requires a bearer token (printed at startup,
 or set with `--token`; pass it as `Authorization: Bearer <t>` or `?token=<t>`).
-CORS is permissive so a browser app on another origin can call it.
+CORS is permissive so a browser app on another origin can call it. The full
+contract is in [`docs/openapi.yaml`](docs/openapi.yaml) (OpenAPI 3.0).
 
-Endpoints (all under `/v1`):
+Read endpoints (all under `/v1`):
 
 | Method & path | Returns |
 |---|---|
@@ -271,6 +272,20 @@ Endpoints (all under `/v1`):
 | `GET /v1/content/:hash` | streams the file's bytes |
 | `GET /v1/content/:hash/meta` | metadata, locations, tags, and links for a hash |
 | `GET /v1/thumb/:hash` | the thumbnail (generated on demand if missing) |
+
+Write endpoints — only available with `--allow-write` (otherwise `403`):
+
+| Method & path | Effect |
+|---|---|
+| `POST /v1/content/:hash/tags` `{"tags":[...]}` | add tags |
+| `DELETE /v1/content/:hash/tags/:tag` | remove a tag |
+| `POST` / `DELETE /v1/content/:hash/favorite` | set / clear favorite |
+| `POST /v1/links` `{"hashes":[...]}` | link hashes (returns the group id) |
+| `DELETE /v1/links/:hash` | unlink a hash |
+| `POST /v1/content/:hash/dedup` `{"keep_drive","keep_path","confirm":true}` | keep one copy, delete the others (leaving `.dedup` pointers) |
+
+The dedup endpoint **deletes files** and requires `"confirm": true` (else `400`);
+offline copies are skipped. Mutations are index-keyed by hash, matching the CLI.
 
 ## Common options
 

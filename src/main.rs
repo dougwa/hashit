@@ -512,6 +512,9 @@ struct ServeArgs {
     /// Disable token auth (use only on trusted local setups).
     #[arg(long)]
     no_token: bool,
+    /// Expose mutating endpoints (tag/link edits, dedup). Off by default.
+    #[arg(long)]
+    allow_write: bool,
 }
 
 #[cfg(feature = "extract")]
@@ -929,7 +932,7 @@ fn run(cli: Cli) -> Result<()> {
             } else {
                 Some(a.token.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()))
             };
-            serve::run(&a.host, a.port, token)
+            serve::run(&a.host, a.port, token, a.allow_write)
         }
     }
 }

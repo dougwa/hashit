@@ -1,0 +1,351 @@
+openapi: 3.0.3
+info:
+  title: hashit-api
+  version: "0.1.0"
+  description: >
+    Headless, read-mostly HTTP API over the hashit metadata index — a low-level
+    logical filesystem across drives, keyed by content hash. Served by
+    `hashit serve` (built with `--features serve`). hashit ships no UI; this API
+    is the contract a web front-end (this project) consumes.
+
+
+    Auth: localhost-bound by default; a bearer token is required unless the
+    server is started with `--no-token`. Send it as `Authorization: Bearer <t>`
+    or `?token=<t>`. CORS is permissive (any origin) so a browser app on another
+    origin can call it.
+
+
+    Writes: mutating endpoints are only available when the server is started with
+    `--allow-write`; otherwise they return 403.
+servers:
+  - url: http://127.0.0.1:8087
+    description: Default local server (override host/port via `hashit serve`)
+
+security:
+  - bearerAuth: []
+  - tokenQuery: []
+
+paths:
+  /v1/drives:
+    get:
+      summary: List indexed drives
+      description: Drives in the index, with online/offline state refreshed against disk.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Drive" }
+
+  /v1/ls:
+    get:
+      summary: List a logical directory
+      description: Immediate children (files + synthesized subdirectories) of a path on a drive.
+      parameters:
+        - { name: drive, in: query, required: true, schema: { type: string }, description: Drive id }
+        - { name: path, in: query, required: false, schema: { type: string, default: "" }, description: "Forward-slash path; empty = drive root" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/DirEntry" }
+
+  /v1/stat:
+    get:
+      summary: Describe one logical path
+      parameters:
+        - { name: drive, in: query, required: true, schema: { type: string } }
+        - { name: path, in: query, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DirEntry" }
+        "404": { description: No such path }
+
+  /v1/query:
+    get:
+      summary: Reverse-index query (paginated)
+      description: Query content grouped by hash. All filters are optional and AND together.
+      parameters:
+        - { name: type, in: query, schema: { type: string }, description: "Coarse file type category, e.g. image, video, audio, application, text" }
+        - { name: ext, in: query, schema: { type: string }, description: "File extension, e.g. cr2" }
+        - { name: hash, in: query, schema: { type: string }, description: Hash prefix }
+        - { name: drive, in: query, schema: { type: string }, description: Only content present on this drive id }
+        - { name: offline, in: query, schema: { type: boolean }, description: Only content with no copy on a currently-online drive }
+        - { name: key, in: query, schema: { type: string }, description: Only content carrying this metadata key }
+        - { name: value, in: query, schema: { type: string }, description: Together with key, require this value }
+        - { name: tag, in: query, schema: { type: string }, description: Only content carrying this user tag }
+        - { name: favorite, in: query, schema: { type: boolean }, description: Only favorites }
+        - { name: limit, in: query, schema: { type: integer, default: 100, minimum: 1, maximum: 1000 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0, minimum: 0 } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/QueryRow" }
+
+  /v1/content/{hash}:
+    get:
+      summary: Stream a file's bytes
+      description: Streams the bytes of one copy of the content (prefers an online drive).
+      parameters:
+        - $ref: "#/components/parameters/Hash"
+      responses:
+        "200":
+          description: File bytes
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        "404": { description: Hash not indexed or no readable copy online }
+
+  /v1/content/{hash}/meta:
+    get:
+      summary: Full detail for a content hash
+      parameters:
+        - $ref: "#/components/parameters/Hash"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ContentDetail" }
+        "404": { description: Hash not indexed }
+
+  /v1/thumb/{hash}:
+    get:
+      summary: Get a thumbnail
+      description: Returns a JPEG thumbnail, generating and caching it on demand if missing.
+      parameters:
+        - $ref: "#/components/parameters/Hash"
+      responses:
+        "200":
+          description: Thumbnail
+          content:
+            image/jpeg:
+              schema: { type: string, format: binary }
+        "404": { description: No thumbnail available (e.g. undecodable format) }
+
+  /v1/content/{hash}/tags:
+    post:
+      summary: Add tags (write)
+      description: Requires the server to be started with `--allow-write`.
+      parameters:
+        - $ref: "#/components/parameters/Hash"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tags]
+              properties:
+                tags: { type: array, items: { type: string } }
+      responses:
+        "200":
+          description: The hash's full tag list after the change
+          content:
+            application/json:
+              schema: { type: array, items: { type: string } }
+        "403": { $ref: "#/components/responses/WritesDisabled" }
+
+  /v1/content/{hash}/tags/{tag}:
+    delete:
+      summary: Remove a tag (write)
+      parameters:
+        - $ref: "#/components/parameters/Hash"
+        - { name: tag, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Remaining tags
+          content:
+            application/json:
+              schema: { type: array, items: { type: string } }
+        "403": { $ref: "#/components/responses/WritesDisabled" }
+
+  /v1/content/{hash}/favorite:
+    post:
+      summary: Mark as favorite (write)
+      parameters: [ { $ref: "#/components/parameters/Hash" } ]
+      responses:
+        "204": { description: Favorited }
+        "403": { $ref: "#/components/responses/WritesDisabled" }
+    delete:
+      summary: Clear favorite (write)
+      parameters: [ { $ref: "#/components/parameters/Hash" } ]
+      responses:
+        "204": { description: Unfavorited }
+        "403": { $ref: "#/components/responses/WritesDisabled" }
+
+  /v1/links:
+    post:
+      summary: Link hashes (write)
+      description: Link two or more hashes into one group (e.g. a JPG + its RAW). Overlapping groups merge.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [hashes]
+              properties:
+                hashes: { type: array, items: { type: string }, minItems: 2 }
+      responses:
+        "200":
+          description: The resulting group id
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { group: { type: string } }
+        "403": { $ref: "#/components/responses/WritesDisabled" }
+
+  /v1/links/{hash}:
+    delete:
+      summary: Unlink a hash (write)
+      parameters: [ { $ref: "#/components/parameters/Hash" } ]
+      responses:
+        "200":
+          description: Whether the hash had been linked
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { unlinked: { type: boolean } }
+        "403": { $ref: "#/components/responses/WritesDisabled" }
+
+  /v1/content/{hash}/dedup:
+    post:
+      summary: Dedup — keep one copy, delete the others (write, destructive)
+      description: >
+        Keeps the copy at (keep_drive, keep_path) and deletes the other on-disk
+        copies of this hash, leaving a `<file>.dedup` pointer beside each removed
+        file (matching the CLI). Offline copies are skipped. Requires
+        `--allow-write` and an explicit `confirm: true`.
+      parameters: [ { $ref: "#/components/parameters/Hash" } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [keep_drive, keep_path, confirm]
+              properties:
+                keep_drive: { type: string }
+                keep_path: { type: string, description: Forward-slash path on keep_drive }
+                confirm: { type: boolean, description: Must be true; this deletes files }
+      responses:
+        "200":
+          description: What was kept/removed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DedupOutcome" }
+        "400": { description: "confirm was not true" }
+        "403": { $ref: "#/components/responses/WritesDisabled" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+    tokenQuery:
+      type: apiKey
+      in: query
+      name: token
+  parameters:
+    Hash:
+      name: hash
+      in: path
+      required: true
+      schema: { type: string }
+      description: Content hash (full, or a unique-enough prefix)
+  responses:
+    WritesDisabled:
+      description: Server was not started with `--allow-write`
+  schemas:
+    Drive:
+      type: object
+      properties:
+        drive_id: { type: string }
+        label: { type: string }
+        last_root: { type: string, description: Last filesystem path the drive was indexed at }
+        first_seen: { type: string, format: date-time }
+        last_seen: { type: string, format: date-time }
+        online: { type: boolean }
+        detached: { type: boolean }
+        files: { type: integer, description: Number of location rows on this drive }
+    DirEntry:
+      type: object
+      description: A file or a synthesized subdirectory in a logical listing.
+      required: [name, kind]
+      properties:
+        name: { type: string }
+        kind: { type: string, enum: [file, dir] }
+        algo: { type: string, nullable: true, description: "Present for files" }
+        hash: { type: string, nullable: true, description: "Present for files" }
+        size: { type: integer, nullable: true, description: "Present for files (bytes)" }
+        file_type: { type: string, nullable: true }
+        ext: { type: string, nullable: true }
+        has_thumb: { type: boolean, nullable: true, description: "Present for files" }
+        file_count: { type: integer, nullable: true, description: "Present for directories: files beneath it" }
+    QueryRow:
+      type: object
+      description: One content hash plus where/how it appears.
+      properties:
+        algo: { type: string }
+        hash: { type: string }
+        file_type: { type: string, nullable: true }
+        ext: { type: string, nullable: true }
+        size: { type: integer }
+        locations: { type: integer, description: Number of copies recorded }
+        online: { type: boolean, description: Any copy on a currently-online drive }
+        has_thumb: { type: boolean }
+        drives: { type: string, description: Comma-separated drive ids holding this hash }
+        sample_path: { type: string, description: A representative path }
+        tags: { type: string, description: Comma-separated user tags }
+        link_group: { type: string, nullable: true, description: Link group id if linked }
+    ContentDetail:
+      type: object
+      properties:
+        algo: { type: string }
+        hash: { type: string }
+        size: { type: integer }
+        file_type: { type: string, nullable: true }
+        ext: { type: string, nullable: true }
+        extracted_at: { type: string, format: date-time }
+        has_thumb: { type: boolean }
+        metadata:
+          type: array
+          items: { $ref: "#/components/schemas/MetaTag" }
+        locations:
+          type: array
+          items: { $ref: "#/components/schemas/Location" }
+        tags: { type: array, items: { type: string } }
+        links: { type: array, items: { type: string }, description: Other hashes linked to this one }
+    MetaTag:
+      type: object
+      properties:
+        group: { type: string, description: "Family-0 group, e.g. EXIF, File, PNG" }
+        key: { type: string }
+        value: { type: string, description: Human-readable rendering }
+    Location:
+      type: object
+      properties:
+        drive_id: { type: string }
+        path: { type: string, description: Forward-slash path relative to the drive root }
+        online: { type: boolean }
+    DedupOutcome:
+      type: object
+      properties:
+        kept: { type: string, description: "drive_id:path of the kept copy" }
+        removed: { type: array, items: { type: string }, description: "drive_id:path of each removed copy" }
+        skipped_offline: { type: integer, description: Copies left because their drive is offline }
