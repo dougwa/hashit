@@ -258,7 +258,8 @@ hashit serve [--host 127.0.0.1] [--port 8087] [--token TOKEN | --no-token] [--al
 
 Binds to localhost by default and requires a bearer token (printed at startup,
 or set with `--token`; pass it as `Authorization: Bearer <t>` or `?token=<t>`).
-CORS is permissive so a browser app on another origin can call it.
+CORS is permissive so a browser app on another origin can call it. The full
+contract is in [`docs/openapi.yaml`](docs/openapi.yaml) (OpenAPI 3.0).
 
 Read endpoints (all under `/v1`):
 
