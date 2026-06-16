@@ -22,6 +22,7 @@ const SCHEMA_VERSION: i64 = 1;
 pub const FAVORITE_TAG: &str = "favorite";
 
 /// One flattened metadata tag (EAV row).
+#[derive(Debug, Serialize)]
 pub struct MetaTag {
     pub group: String,
     pub key: String,
@@ -91,6 +92,86 @@ pub struct QueryRow {
     pub tags: String,
     /// Link group id, if this hash is linked to others.
     pub link_group: Option<String>,
+}
+
+/// One entry in a logical directory listing: a file or a subdirectory.
+#[cfg(feature = "serve")]
+#[derive(Debug, Serialize)]
+pub struct DirEntry {
+    pub name: String,
+    /// "file" or "dir".
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub algo: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ext: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_thumb: Option<bool>,
+    /// For directories: number of files beneath it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_count: Option<i64>,
+}
+
+#[cfg(feature = "serve")]
+impl DirEntry {
+    fn dir(name: String, file_count: i64) -> DirEntry {
+        DirEntry {
+            name,
+            kind: "dir".to_string(),
+            algo: None,
+            hash: None,
+            size: None,
+            file_type: None,
+            ext: None,
+            has_thumb: None,
+            file_count: Some(file_count),
+        }
+    }
+}
+
+/// One place a content hash is found.
+#[cfg(feature = "serve")]
+#[derive(Debug, Serialize)]
+pub struct LocationRow {
+    pub drive_id: String,
+    pub path: String,
+    pub online: bool,
+}
+
+/// Full detail for one content hash.
+#[cfg(feature = "serve")]
+#[derive(Debug, Serialize)]
+pub struct ContentDetail {
+    pub algo: String,
+    pub hash: String,
+    pub size: i64,
+    pub file_type: Option<String>,
+    pub ext: Option<String>,
+    pub extracted_at: String,
+    pub has_thumb: bool,
+    pub metadata: Vec<MetaTag>,
+    pub locations: Vec<LocationRow>,
+    pub tags: Vec<String>,
+    /// Other hashes linked to this one.
+    pub links: Vec<String>,
+}
+
+/// The exclusive upper bound for a path-prefix range scan: `prefix` with its
+/// last byte incremented (e.g. "a/" -> "a0"), so `path >= prefix AND path < hi`
+/// selects exactly the subtree without LIKE-metacharacter pitfalls.
+#[cfg(feature = "serve")]
+fn prefix_upper(prefix: &str) -> String {
+    let mut bytes = prefix.as_bytes().to_vec();
+    if let Some(last) = bytes.last_mut() {
+        *last += 1;
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 pub struct Store {
@@ -193,6 +274,7 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS idx_loc_drive ON locations (drive_id);
             CREATE INDEX IF NOT EXISTS idx_loc_hash  ON locations (algo, hash);
+            CREATE INDEX IF NOT EXISTS idx_loc_drive_path ON locations (drive_id, path);
             CREATE INDEX IF NOT EXISTS idx_content_type ON content (file_type);
             CREATE INDEX IF NOT EXISTS idx_content_ext  ON content (ext);
             CREATE INDEX IF NOT EXISTS idx_meta_kv ON metadata (key, value);
@@ -609,6 +691,260 @@ impl Store {
             )
             .optional()?;
         Ok(row)
+    }
+
+    // -- logical filesystem -------------------------------------------------
+
+    /// List the immediate children of `path` on `drive` (use "" for the drive
+    /// root). Subdirectories are synthesized from file paths; files carry their
+    /// content summary. Paths use forward slashes, matching `locations.path`.
+    #[cfg(feature = "serve")]
+    pub fn list_dir(&self, drive: &str, path: &str) -> Result<Vec<DirEntry>> {
+        let path = path.trim_matches('/');
+        let prefix = if path.is_empty() {
+            String::new()
+        } else {
+            format!("{path}/")
+        };
+        // `plen` is a CHAR count (SQLite substr/instr are char-based).
+        let plen = prefix.chars().count() as i64;
+        // Range bound to scan only this subtree (avoids LIKE metachar issues).
+        let (lo, hi) = if prefix.is_empty() {
+            (String::new(), String::new())
+        } else {
+            (prefix.clone(), prefix_upper(&prefix))
+        };
+        let range = if prefix.is_empty() {
+            ""
+        } else {
+            "AND l.path >= ?2 AND l.path < ?3"
+        };
+
+        let mut out: Vec<DirEntry> = Vec::new();
+
+        // Files directly in `path` (no further '/').
+        let files_sql = format!(
+            r#"
+            SELECT substr(l.path, ?4 + 1) AS name, l.algo, l.hash,
+                   c.size, c.file_type, c.ext, c.has_thumb
+            FROM locations l
+            JOIN content c ON c.algo = l.algo AND c.hash = l.hash
+            WHERE l.drive_id = ?1 {range}
+              AND instr(substr(l.path, ?4 + 1), '/') = 0
+            ORDER BY name
+            "#
+        );
+        {
+            let mut stmt = self.conn.prepare(&files_sql)?;
+            let rows = stmt.query_map(params![drive, lo, hi, plen], |r| {
+                Ok(DirEntry {
+                    name: r.get(0)?,
+                    kind: "file".to_string(),
+                    algo: r.get(1)?,
+                    hash: r.get(2)?,
+                    size: r.get(3)?,
+                    file_type: r.get(4)?,
+                    ext: r.get(5)?,
+                    has_thumb: Some(r.get::<_, i64>(6)? != 0),
+                    file_count: None,
+                })
+            })?;
+            for row in rows {
+                out.push(row?);
+            }
+        }
+
+        // Subdirectories: the next path segment among deeper entries.
+        let dirs_sql = format!(
+            r#"
+            SELECT child, COUNT(*) AS n FROM (
+                SELECT substr(rest, 1, instr(rest, '/') - 1) AS child
+                FROM (SELECT substr(l.path, ?4 + 1) AS rest
+                      FROM locations l WHERE l.drive_id = ?1 {range})
+                WHERE instr(rest, '/') > 0
+            )
+            GROUP BY child ORDER BY child
+            "#
+        );
+        {
+            let mut stmt = self.conn.prepare(&dirs_sql)?;
+            let rows = stmt.query_map(params![drive, lo, hi, plen], |r| {
+                Ok(DirEntry {
+                    name: r.get(0)?,
+                    kind: "dir".to_string(),
+                    algo: None,
+                    hash: None,
+                    size: None,
+                    file_type: None,
+                    ext: None,
+                    has_thumb: None,
+                    file_count: Some(r.get(1)?),
+                })
+            })?;
+            for row in rows {
+                out.push(row?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Describe a single logical path: a file (with its content summary) or a
+    /// directory (with a descendant file count). `None` if nothing matches.
+    #[cfg(feature = "serve")]
+    pub fn stat(&self, drive: &str, path: &str) -> Result<Option<DirEntry>> {
+        let path = path.trim_matches('/');
+        if path.is_empty() {
+            // The drive root is a directory.
+            let n: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM locations WHERE drive_id = ?1",
+                params![drive],
+                |r| r.get(0),
+            )?;
+            return Ok(Some(DirEntry::dir(String::new(), n)));
+        }
+        // File?
+        let name = path.rsplit('/').next().unwrap_or(path).to_string();
+        let file = self
+            .conn
+            .query_row(
+                r#"
+                SELECT l.algo, l.hash, c.size, c.file_type, c.ext, c.has_thumb
+                FROM locations l JOIN content c ON c.algo=l.algo AND c.hash=l.hash
+                WHERE l.drive_id = ?1 AND l.path = ?2
+                "#,
+                params![drive, path],
+                |r| {
+                    Ok(DirEntry {
+                        name: name.clone(),
+                        kind: "file".to_string(),
+                        algo: r.get(0)?,
+                        hash: r.get(1)?,
+                        size: r.get(2)?,
+                        file_type: r.get(3)?,
+                        ext: r.get(4)?,
+                        has_thumb: Some(r.get::<_, i64>(5)? != 0),
+                        file_count: None,
+                    })
+                },
+            )
+            .optional()?;
+        if let Some(f) = file {
+            return Ok(Some(f));
+        }
+        // Directory? (any descendant)
+        let prefix = format!("{path}/");
+        let hi = prefix_upper(&prefix);
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM locations WHERE drive_id = ?1 AND path >= ?2 AND path < ?3",
+            params![drive, prefix, hi],
+            |r| r.get(0),
+        )?;
+        if n > 0 {
+            Ok(Some(DirEntry::dir(name, n)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Resolve a hash (full or prefix) to an absolute readable path, preferring
+    /// online drives. Returns `(algo, hash, abs path)`.
+    #[cfg(feature = "serve")]
+    pub fn content_source(&self, hash_prefix: &str) -> Result<Option<(String, String, PathBuf)>> {
+        let row = self
+            .conn
+            .query_row(
+                r#"
+                SELECT c.algo, c.hash, dr.last_root, l.path
+                FROM content c
+                JOIN locations l ON l.algo = c.algo AND l.hash = c.hash
+                JOIN drives dr   ON dr.drive_id = l.drive_id AND dr.detached = 0
+                WHERE c.hash LIKE ?1
+                ORDER BY dr.online DESC
+                LIMIT 1
+                "#,
+                params![format!("{hash_prefix}%")],
+                |r| {
+                    let algo: String = r.get(0)?;
+                    let hash: String = r.get(1)?;
+                    let root: String = r.get(2)?;
+                    let path: String = r.get(3)?;
+                    Ok((algo, hash, PathBuf::from(root).join(path)))
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Full detail for a content hash: summary, metadata, locations, tags, links.
+    #[cfg(feature = "serve")]
+    pub fn content_detail(&self, hash_prefix: &str) -> Result<Option<ContentDetail>> {
+        let (algo, hash) = match self.resolve_hash(hash_prefix) {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        };
+        let summary = self.conn.query_row(
+            "SELECT size, file_type, ext, extracted_at, has_thumb FROM content WHERE algo=?1 AND hash=?2",
+            params![algo, hash],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4)? != 0,
+                ))
+            },
+        )?;
+        let metadata = {
+            let mut stmt = self.conn.prepare(
+                "SELECT grp, key, value FROM metadata WHERE algo=?1 AND hash=?2 ORDER BY grp, key",
+            )?;
+            let rows = stmt.query_map(params![algo, hash], |r| {
+                Ok(MetaTag {
+                    group: r.get(0)?,
+                    key: r.get(1)?,
+                    value: r.get(2)?,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let locations = {
+            let mut stmt = self.conn.prepare(
+                r#"
+                SELECT l.drive_id, l.path, dr.online
+                FROM locations l JOIN drives dr ON dr.drive_id = l.drive_id
+                WHERE l.algo=?1 AND l.hash=?2 ORDER BY l.drive_id, l.path
+                "#,
+            )?;
+            let rows = stmt.query_map(params![algo, hash], |r| {
+                Ok(LocationRow {
+                    drive_id: r.get(0)?,
+                    path: r.get(1)?,
+                    online: r.get::<_, i64>(2)? != 0,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let tags = self.list_tags(&algo, &hash)?;
+        let links = self
+            .list_group(&algo, &hash)?
+            .into_iter()
+            .map(|(_, h)| h)
+            .filter(|h| *h != hash)
+            .collect();
+        Ok(Some(ContentDetail {
+            algo,
+            hash,
+            size: summary.0,
+            file_type: summary.1,
+            ext: summary.2,
+            extracted_at: summary.3,
+            has_thumb: summary.4,
+            metadata,
+            locations,
+            tags,
+            links,
+        }))
     }
 
     // -- query --------------------------------------------------------------

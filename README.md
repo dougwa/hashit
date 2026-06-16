@@ -31,6 +31,13 @@ without it — and without those dependencies — disable default features:
 cargo build --release --no-default-features
 ```
 
+The headless HTTP API (`hashit serve`) is behind the (non-default) `serve`
+feature, which pulls in an async HTTP stack:
+
+```sh
+cargo build --release --features serve
+```
+
 ## How it works
 
 Each directory gets its own `.hashit` file (JSON) listing the files **directly**
@@ -237,6 +244,33 @@ member that would leave a single file dissolves the group.
 
 `watch` also accepts `--index` to keep the index in sync with live filesystem
 changes as it updates manifests.
+
+## Headless API (`serve`)
+
+*(Requires the `serve` feature: `cargo build --features serve`.)* `hashit serve`
+exposes the index as a small, **read-only HTTP/JSON API** — a low-level logical
+filesystem over your drives. hashit ships **no UI**; build a web app (any
+framework) on top of this API.
+
+```sh
+hashit serve [--host 127.0.0.1] [--port 8087] [--token TOKEN | --no-token]
+```
+
+Binds to localhost by default and requires a bearer token (printed at startup,
+or set with `--token`; pass it as `Authorization: Bearer <t>` or `?token=<t>`).
+CORS is permissive so a browser app on another origin can call it.
+
+Endpoints (all under `/v1`):
+
+| Method & path | Returns |
+|---|---|
+| `GET /v1/drives` | indexed drives + online/offline status |
+| `GET /v1/ls?drive=&path=` | immediate children of a logical directory (`path=""` = root) |
+| `GET /v1/stat?drive=&path=` | one entry (file summary or directory) |
+| `GET /v1/query?type=&ext=&tag=&favorite=&drive=&offline=&key=&value=&hash=&limit=&offset=` | paginated reverse-index query |
+| `GET /v1/content/:hash` | streams the file's bytes |
+| `GET /v1/content/:hash/meta` | metadata, locations, tags, and links for a hash |
+| `GET /v1/thumb/:hash` | the thumbnail (generated on demand if missing) |
 
 ## Common options
 

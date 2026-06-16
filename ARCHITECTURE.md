@@ -21,6 +21,8 @@ lives in the manifest, scan, and hashing layers.
 | `drive.rs` | Per-drive `.hashit-drive` id marker and online/offline presence. *(`extract` feature)* |
 | `extract/` | Extraction engine: file-type detection, EXIF (`exiftool_rs`), thumbnails (`magick-*`). *(`extract` feature)* |
 | `index.rs` | Orchestrates scan → store reconciliation → extract-once-per-hash; `Indexer` for incremental watch updates. *(`extract` feature)* |
+| `api.rs` | Typed, transport-agnostic logical-FS operations over the store (the API contract). *(`serve` feature)* |
+| `serve.rs` | Thin axum HTTP layer exposing `api.rs` as a headless JSON API. *(`serve` feature)* |
 
 ## Data model (`manifest.rs`)
 
@@ -130,6 +132,27 @@ index for rich metadata, keyed by content hash rather than path.
 The core `scan`/manifest path is untouched by all of this — the index is
 additive and entirely behind the `extract` feature, which also gates its heavier
 dependencies (SQLite, the metadata/image crates).
+
+## Headless API (optional `serve` feature)
+
+`hashit serve` exposes the index as a read-only logical filesystem over HTTP.
+hashit ships no UI; an external web app is meant to be built on top.
+
+- **`api.rs`** is the contract: typed, transport-agnostic operations over the
+  store — `drives`, `list_dir`/`stat` (a per-drive directory tree synthesized
+  from `locations.path`), `query`, `content_source`, `detail`, and `thumb`
+  (generate-on-demand). A Rust consumer can call these directly.
+- **`serve.rs`** is a thin axum layer: `/v1/{drives,ls,stat,query,content/:hash,
+  content/:hash/meta,thumb/:hash}`. It binds localhost, guards requests with a
+  bearer token (header or `?token=`), and sets permissive CORS so a browser app
+  on another origin can call it. Each request opens the index on a blocking
+  thread (SQLite WAL → concurrent readers), so no connection is held across an
+  `.await`. Directory listings use a path-prefix **range scan**
+  (`path >= prefix AND path < prefix‖+1`) plus SQL `substr`/`instr` to compute
+  immediate children — no full-subtree materialization.
+
+The `serve` feature implies `extract` and adds the async HTTP stack
+(`tokio`, `axum`, `tower-http`); the default build does not include it.
 
 ## Key invariants
 
