@@ -31,6 +31,13 @@ without it — and without those dependencies — disable default features:
 cargo build --release --no-default-features
 ```
 
+The headless HTTP API (`hashit serve`) is behind the (non-default) `serve`
+feature, which pulls in an async HTTP stack:
+
+```sh
+cargo build --release --features serve
+```
+
 ## How it works
 
 Each directory gets its own `.hashit` file (JSON) listing the files **directly**
@@ -187,9 +194,10 @@ hashit query [--type CATEGORY] [--ext EXT] [--hash PREFIX] [--drive ID]
 
 Paginated, server-side queries grouped by content hash. Filter by coarse type
 (`--type image`), extension (`--ext cr2`), hash prefix, drive, presence
-(`--offline` = no copy on a currently-online drive), or a metadata key/value
-(`--key Model --value "Canon EOS R5"`). Reads only a page at a time, so it scales
-to very large indexes.
+(`--offline` = no copy on a currently-online drive), a metadata key/value
+(`--key Model --value "Canon EOS R5"`), a user tag (`--tag sunset`), or favorites
+(`--favorite`). Each row includes its tags and link group. Reads only a page at a
+time, so it scales to very large indexes.
 
 ### drive — manage indexed drives
 
@@ -205,8 +213,79 @@ hashit drive relabel <drive-id> <name>
 hashit thumb <hash-or-prefix>          # prints the cached thumbnail path (generating it if missing)
 ```
 
+### tag / fav — custom tags and favorites
+
+```sh
+hashit tag add <hash> <tag>...         # attach one or more tags
+hashit tag rm  <hash> <tag>...         # remove tags
+hashit tag ls  <hash>                  # list a hash's tags
+hashit fav <hash>                      # mark a favorite (the "favorite" tag)
+hashit unfav <hash>
+```
+
+Tags are stored in the index **by content hash**, so they apply to every copy of
+that content across all drives, and survive moves. (Tags live only in the index;
+they are not written back into the original files.) Filter with
+`hashit query --tag <tag>` or `--favorite`.
+
+### link — logically group related files
+
+```sh
+hashit link <hash> <hash>...           # link two or more hashes (e.g. a JPG + its RAW)
+hashit link --auto <path>...           # auto-link sidecars: same basename, different extension
+hashit links <hash>                    # show a hash's link group
+hashit unlink <hash>                   # remove a hash from its group
+```
+
+Links are also keyed by content hash. `--auto` pairs files in the same directory
+that share a basename but differ in extension (e.g. `IMG_0001.JPG` +
+`IMG_0001.CR2`). Linking sets that overlap are merged into one group; removing a
+member that would leave a single file dissolves the group.
+
 `watch` also accepts `--index` to keep the index in sync with live filesystem
 changes as it updates manifests.
+
+## Headless API (`serve`)
+
+*(Requires the `serve` feature: `cargo build --features serve`.)* `hashit serve`
+exposes the index as a small, **read-only HTTP/JSON API** — a low-level logical
+filesystem over your drives. hashit ships **no UI**; build a web app (any
+framework) on top of this API.
+
+```sh
+hashit serve [--host 127.0.0.1] [--port 8087] [--token TOKEN | --no-token] [--allow-write]
+```
+
+Binds to localhost by default and requires a bearer token (printed at startup,
+or set with `--token`; pass it as `Authorization: Bearer <t>` or `?token=<t>`).
+CORS is permissive so a browser app on another origin can call it. The full
+contract is in [`docs/openapi.yaml`](docs/openapi.yaml) (OpenAPI 3.0).
+
+Read endpoints (all under `/v1`):
+
+| Method & path | Returns |
+|---|---|
+| `GET /v1/drives` | indexed drives + online/offline status |
+| `GET /v1/ls?drive=&path=` | immediate children of a logical directory (`path=""` = root) |
+| `GET /v1/stat?drive=&path=` | one entry (file summary or directory) |
+| `GET /v1/query?type=&ext=&tag=&favorite=&drive=&offline=&key=&value=&hash=&limit=&offset=` | paginated reverse-index query |
+| `GET /v1/content/:hash` | streams the file's bytes |
+| `GET /v1/content/:hash/meta` | metadata, locations, tags, and links for a hash |
+| `GET /v1/thumb/:hash` | the thumbnail (generated on demand if missing) |
+
+Write endpoints — only available with `--allow-write` (otherwise `403`):
+
+| Method & path | Effect |
+|---|---|
+| `POST /v1/content/:hash/tags` `{"tags":[...]}` | add tags |
+| `DELETE /v1/content/:hash/tags/:tag` | remove a tag |
+| `POST` / `DELETE /v1/content/:hash/favorite` | set / clear favorite |
+| `POST /v1/links` `{"hashes":[...]}` | link hashes (returns the group id) |
+| `DELETE /v1/links/:hash` | unlink a hash |
+| `POST /v1/content/:hash/dedup` `{"keep_drive","keep_path","confirm":true}` | keep one copy, delete the others (leaving `.dedup` pointers) |
+
+The dedup endpoint **deletes files** and requires `"confirm": true` (else `400`);
+offline copies are skipped. Mutations are index-keyed by hash, matching the CLI.
 
 ## Common options
 

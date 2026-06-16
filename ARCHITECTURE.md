@@ -21,6 +21,8 @@ lives in the manifest, scan, and hashing layers.
 | `drive.rs` | Per-drive `.hashit-drive` id marker and online/offline presence. *(`extract` feature)* |
 | `extract/` | Extraction engine: file-type detection, EXIF (`exiftool_rs`), thumbnails (`magick-*`). *(`extract` feature)* |
 | `index.rs` | Orchestrates scan → store reconciliation → extract-once-per-hash; `Indexer` for incremental watch updates. *(`extract` feature)* |
+| `api.rs` | Typed, transport-agnostic logical-FS operations over the store (the API contract). *(`serve` feature)* |
+| `serve.rs` | Thin axum HTTP layer exposing `api.rs` as a headless JSON API. *(`serve` feature)* |
 
 ## Data model (`manifest.rs`)
 
@@ -98,9 +100,11 @@ index for rich metadata, keyed by content hash rather than path.
   (`$HASHIT_HOME` overrides; WAL + a `schema_meta` version row for migrations)
   with a sibling `cache/` for thumbnails. Tables: `drives`, `content` (one row
   per `(algo, hash)`), `metadata` (EAV: `key`/`value`, indexed for reverse
-  lookups), and `locations` (one row per `(algo, hash, drive, path)`). The DB is
-  rebuildable from the `.hashit` manifests, so corruption is recovered by
-  re-indexing.
+  lookups), `locations` (one row per `(algo, hash, drive, path)`), `tags`
+  (user tags/favorites, keyed by hash), and `link_members` (hash → link group).
+  Everything except user tags/links is rebuildable from the `.hashit` manifests,
+  so corruption is recovered by re-indexing; tags and links are user-authored
+  state and key by content hash, so they apply to every copy.
 - **Drives (`drive.rs`)** — each root carries a `.hashit-drive` marker (a UUID +
   label, written atomically like a manifest). The UUID is the stable `drive_id`;
   it travels with the drive (works on exFAT, unlike volume UUIDs). Presence is
@@ -118,9 +122,43 @@ index for rich metadata, keyed by content hash rather than path.
   does the same for a single directory and is driven by `watch --index` via a
   callback, so live filesystem activity updates the index incrementally.
 
+- **Tags & links (`store.rs`, CLI in `main.rs`)** — `tag`/`fav` attach
+  hash-keyed user tags (favorites are the reserved `favorite` tag); `link` groups
+  related hashes (e.g. a JPG + its RAW), with `link --auto` detecting same-stem,
+  different-extension sidecars via `index::auto_link_groups`. Linking overlapping
+  sets merges their groups; unlinking down to one member dissolves the group.
+  Both are index-only (never written back to the original files).
+
 The core `scan`/manifest path is untouched by all of this — the index is
 additive and entirely behind the `extract` feature, which also gates its heavier
 dependencies (SQLite, the metadata/image crates).
+
+## Headless API (optional `serve` feature)
+
+`hashit serve` exposes the index as a read-only logical filesystem over HTTP.
+hashit ships no UI; an external web app is meant to be built on top.
+
+- **`api.rs`** is the contract: typed, transport-agnostic operations over the
+  store — `drives`, `list_dir`/`stat` (a per-drive directory tree synthesized
+  from `locations.path`), `query`, `content_source`, `detail`, and `thumb`
+  (generate-on-demand). A Rust consumer can call these directly.
+- **`serve.rs`** is a thin axum layer: `/v1/{drives,ls,stat,query,content/:hash,
+  content/:hash/meta,thumb/:hash}`. It binds localhost, guards requests with a
+  bearer token (header or `?token=`), and sets permissive CORS so a browser app
+  on another origin can call it. Each request opens the index on a blocking
+  thread (SQLite WAL → concurrent readers), so no connection is held across an
+  `.await`. Directory listings use a path-prefix **range scan**
+  (`path >= prefix AND path < prefix‖+1`) plus SQL `substr`/`instr` to compute
+  immediate children — no full-subtree materialization.
+
+  Mutating endpoints (tag/favorite, link/unlink, and dedup "keep this") are
+  opt-in via `--allow-write` (else `403`) and route through the same `api.rs`
+  ops, reusing `dedup::remove_one` + `scan::process_dir` so deletions update the
+  `.hashit` manifests and the index together; the dedup call requires an explicit
+  `confirm` and skips offline copies.
+
+The `serve` feature implies `extract` and adds the async HTTP stack
+(`tokio`, `axum`, `tower-http`); the default build does not include it.
 
 ## Key invariants
 

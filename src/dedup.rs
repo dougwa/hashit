@@ -162,7 +162,8 @@ fn prompt_choice_line(n: usize) -> Result<Choice> {
 }
 
 /// Delete one duplicate and (optionally) leave a pointer to the kept file.
-fn remove_one(removed: &Path, kept: &Path, opts: &DedupOptions) -> Result<()> {
+/// Reused by the API's dedup endpoint, so it stays `pub(crate)`.
+pub(crate) fn remove_one(removed: &Path, kept: &Path, opts: &DedupOptions) -> Result<()> {
     if opts.dry_run {
         return Ok(());
     }
