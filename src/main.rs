@@ -8,6 +8,8 @@ mod scan;
 mod sync;
 mod watch;
 
+#[cfg(feature = "serve")]
+mod api;
 #[cfg(feature = "extract")]
 mod drive;
 #[cfg(feature = "extract")]
@@ -16,6 +18,8 @@ mod extract;
 mod index;
 #[cfg(feature = "extract")]
 mod store;
+#[cfg(feature = "serve")]
+mod serve;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -93,6 +97,9 @@ enum Command {
     /// Show the link group a hash belongs to.
     #[cfg(feature = "extract")]
     Links(FavArgs),
+    /// Serve the headless logical-FS HTTP API over the index (no UI).
+    #[cfg(feature = "serve")]
+    Serve(ServeArgs),
 }
 
 #[derive(Args)]
@@ -488,6 +495,23 @@ enum TagCmd {
     },
     /// List the tags on a hash.
     Ls { hash: String },
+}
+
+#[cfg(feature = "serve")]
+#[derive(Args)]
+struct ServeArgs {
+    /// Address to bind (localhost by default).
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
+    /// Port to listen on (0 = pick a free port).
+    #[arg(long, default_value_t = 8087)]
+    port: u16,
+    /// Bearer token required on requests. Generated randomly if omitted.
+    #[arg(long)]
+    token: Option<String>,
+    /// Disable token auth (use only on trusted local setups).
+    #[arg(long)]
+    no_token: bool,
 }
 
 #[cfg(feature = "extract")]
@@ -897,6 +921,15 @@ fn run(cli: Cli) -> Result<()> {
                 }
             }
             Ok(())
+        }
+        #[cfg(feature = "serve")]
+        Command::Serve(a) => {
+            let token = if a.no_token {
+                None
+            } else {
+                Some(a.token.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()))
+            };
+            serve::run(&a.host, a.port, token)
         }
     }
 }
