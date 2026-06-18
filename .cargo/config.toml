@@ -1,0 +1,6 @@
+# This project pulls some dependencies over SSH from GitHub. Cargo's built-in
+# git client (libgit2) often can't authenticate via ssh-agent, failing with
+# "no authentication methods succeeded". Delegating fetches to the `git` CLI
+# uses your normal SSH setup (~/.ssh/config, agent, keys) and works reliably.
+[net]
+git-fetch-with-cli = true
