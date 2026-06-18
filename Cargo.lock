@@ -664,7 +664,7 @@ dependencies = [
 [[package]]
 name = "exiftool-rs"
 version = "0.1.0"
-source = "git+ssh://git@github.com/dougwa/exiftool-rs.git?rev=dcd8462ea0f74d06df6d07a02072110fb0964044#dcd8462ea0f74d06df6d07a02072110fb0964044"
+source = "git+ssh://git@github.com/dougwa/exiftool-rs.git?rev=06b04462b9d582ac6373ba3774614e6ce3bf75ae#06b04462b9d582ac6373ba3774614e6ce3bf75ae"
 
 [[package]]
 name = "exr"
