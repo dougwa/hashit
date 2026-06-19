@@ -1,182 +1,104 @@
 # Architecture
 
-`hashit` is a single Rust binary. Each subcommand is a module; shared state
-lives in the manifest, scan, and hashing layers.
+`hashit` is a cargo workspace of two binaries over a shared core. The design
+goal is a clean separation between **writing** (the `hashit` scanner, which only
+ever touches individual files under its roots) and the **global read view** (the
+`hashit-idx` daemon, which indexes and searches but never writes).
 
-## Module map
+## Crates
 
-| Module | Responsibility |
-|--------|----------------|
-| `main.rs` | clap CLI: command/arg definitions, dispatch, helpers (`build_options`, `parse_excludes`, `set_workers`, `fileop_scan_opts`). |
-| `manifest.rs` | The `.hashit` data model and shared utilities. |
-| `hash.rs` | `HashAlgo` (Blake3/Sha256) and streaming `hash_file`. |
-| `scan.rs` | The scan engine: `process_dir` (per-directory reconciliation) and `scan` (whole-tree, parallel). |
-| `inventory.rs` | Aggregate all manifests into a JSON/CSV report. |
-| `watch.rs` | Debounced recursive filesystem watcher. |
-| `dedup.rs` | Duplicate detection and removal (interactive/auto). |
-| `diff.rs` | Content-hash set comparison between two trees. |
-| `sync.rs` | Copy content missing between two trees. |
-| `fileops.rs` | Hash-aware `cp`/`mv`/`rm`. |
-| `store.rs` | Global metadata index (SQLite) + thumbnail cache. *(`extract` feature)* |
-| `drive.rs` | Per-drive `.hashit-drive` id marker and online/offline presence. *(`extract` feature)* |
-| `extract/` | Extraction engine: file-type detection, EXIF (`exiftool_rs`), thumbnails (`magick-*`). *(`extract` feature)* |
-| `index.rs` | Orchestrates scan → store reconciliation → extract-once-per-hash; `Indexer` for incremental watch updates. *(`extract` feature)* |
-| `api.rs` | Typed, transport-agnostic logical-FS operations over the store (the API contract). *(`serve` feature)* |
-| `serve.rs` | Thin axum HTTP layer exposing `api.rs` as a headless JSON API. *(`serve` feature)* |
+| Crate | Responsibility | Notable deps |
+|-------|----------------|--------------|
+| `hashit-core` | The portable data model and engines: `.hashit` manifests, hashing, the scan engine, hash-aware file ops, per-hash metadata files, and a manifest walker. Dependency-light so both binaries build fast. | serde, blake3, sha2, walkdir, rayon, glob, chrono |
+| `hashit-extract` | Extraction engine: file-type detection + EXIF (`exiftool_rs`), thumbnails and previews (`magick-*`). Free functions, swappable for an external-tool fallback later. | exiftool_rs, magick-core, magick-codecs |
+| `hashit` | The scanner CLI binary, plus the `watch --serve` gRPC FileOps server. | hashit-core, hashit-extract, clap, notify, tonic, tokio |
+| `hashit-idx` | The index + gRPC Search daemon binary. | hashit-core, rusqlite, notify, tonic, tokio |
 
-## Data model (`manifest.rs`)
+The workspace split keeps `hashit-idx` from ever compiling the image/EXIF crates
+and keeps `hashit` from compiling SQLite.
 
-- `Manifest { version, updated_at, files: BTreeMap<String, FileEntry> }` — one
-  per directory, named `.hashit`. `BTreeMap` keeps output deterministic.
-- `FileEntry { size, mtime_ns, hash, algo, flags, hashed_at }`. Derives `Eq` so a
-  rebuilt manifest can be compared to the old one to **skip writes on no-op
-  scans** (avoids mtime churn).
-- Atomic save: write to `.hashit.tmp.<pid>` then `rename`.
-- Shared helpers used across commands:
-  - `mtime_ns` / `set_mtime` — read/preserve modified time.
-  - `ManifestCache` — lazily loads a source dir's manifest so `cp`/`mv`/`sync`
-    can carry a file's existing entry without re-hashing.
-  - `is_manifest_file` — recognizes `.hashit` and `.hashit.tmp.*`.
+## `hashit-core`
 
-Metadata predicates also live in `scan.rs`: `is_apple_double` (`._*`) and
-`is_dedup_pointer` (`*.dedup`). All three classes are excluded from hashing,
-inventory, and watch reprocessing.
+- **`manifest.rs`** — `Manifest { version, updated_at, files: BTreeMap<String, FileEntry> }`,
+  one `.hashit` per directory. `FileEntry { size, mtime_ns, hash, algo, flags, hashed_at }`
+  derives `Eq` so a rebuilt manifest can be compared to the old one and **skip
+  writes on no-op scans**. Atomic save (temp file + fsync + rename). `ManifestCache`
+  lazily loads a directory's manifest so `cp`/`mv` (and `get`/`put-meta`) can look
+  up a file's entry without re-hashing.
+- **`hash.rs`** — `HashAlgo` (Blake3/Sha256) and streaming `hash_file`.
+- **`scan.rs`** — `process_dir(dir, opts, root)` is the single source of truth for
+  keeping one directory's manifest correct (list files, apply the recompute
+  heuristic, hash pending files in parallel, drop missing entries, write only if
+  changed). `scan(root, opts)` runs `process_dir` across every directory in
+  parallel. Also home to the `is_apple_double` / `is_dedup_pointer` predicates.
+- **`fileops.rs`** — hash-aware `cp`/`mv`/`rm`: scan sources, carry source entries
+  into target manifests (no re-hash), reconcile affected directories.
+- **`meta.rs`** — the per-hash metadata file format and sharded path math
+  (`<meta-folder>/<h0:2>/<h2:4>/<hash>.{meta.json,thumbnail.jpg,preview.jpg}`).
+  `MetaFile { hash, algo, size, file_type, ext, extractor_version, tags, properties, updated_at }`
+  with atomic save. Artifact presence is a plain file-existence check, not stored.
+- **`walk.rs`** — `for_each_entry(root, f)` enumerates every file recorded in every
+  `.hashit` under a root. Shared by the metadata pass and the index build.
 
-## Scan engine (`scan.rs`)
+## `hashit` (scanner CLI)
 
-`process_dir(dir, opts, root)` is the single source of truth for keeping one
-directory's manifest correct, and is reused by every command:
+Commands: `scan`, `watch`, `cp`, `mv`, `rm`, `get-meta`, `put-meta`.
 
-1. Load the existing manifest (map of name → entry).
-2. List direct files (skip subdirs, metadata, and — by default — symlinks).
-3. Apply the recompute heuristic per file: rehash if new / size changed /
-   size-same-but-mtime-changed / algo changed; otherwise reuse the stored hash.
-4. Hash the pending files **in parallel** (rayon) within the directory.
-5. Drop entries for files no longer present.
-6. Write only if the manifest actually changed; delete it if the directory has
-   no files left.
+- **Metadata pass (`meta_pass.rs`)** — after a scan (or per changed dir under
+  `watch`), walks the manifests, dedups by hash, and for each hash **missing** a
+  requested artifact reads one representative copy and calls `hashit-extract` to
+  produce it (parallel via rayon). Idempotent: existing artifacts are left alone,
+  and existing user `properties` are preserved.
+- **get/put-meta (`metacmd.rs`)** — resolve a path → its manifest entry → content
+  hash, then read or edit `<hash>.meta.json`. Edits are hash-keyed, so they apply
+  to every copy. This module is shared by the CLI and the gRPC server.
+- **Watcher (`watch.rs`)** — initial `scan`, then a `notify` debounced watcher;
+  each event batch maps to the set of affected directories, re-run through
+  `process_dir`. An `on_dir` callback lets `watch` drive the metadata pass per
+  changed directory. Own writes (`.hashit`, `._*`) are filtered to avoid loops.
+- **FileOps server (`serve.rs`)** — `watch --serve` starts a tonic gRPC server
+  (`hashit.fileops.v1.FileOps`) bound to localhost, exposing
+  `cp`/`mv`/`rm`/`get-meta`/`put-meta`. Each RPC routes through the same
+  `core::fileops` + `metacmd` code as the CLI. The watcher runs on a background
+  thread while the server runs on a tokio runtime.
 
-`scan(root, opts)` collects every directory under `root` (pruning excluded
-subtrees) and runs `process_dir` across them **in parallel**. `ScanStats`
-accumulates new/modified/unchanged/removed counts via a reduce.
+## `hashit-idx` (index + search daemon)
 
-Concurrency model: directories are processed in parallel, and files within a
-directory are hashed in parallel — good for both wide trees and large
-directories. (A single directory of many huge files hashes within that dir's
-pass; acceptable for current use.)
+- **Store (`store.rs`)** — a rebuildable SQLite index (WAL, `schema_meta` version
+  row). Tables: `files(path PK, dir, name, algo, hash, size, mtime_ns)`,
+  `content(algo, hash → file_type, ext)`, and `meta_kv(algo, hash, kind, key, value)`
+  (`kind` = tag | property), indexed for reverse lookups. `rebuild` walks each
+  root's `.hashit` (via `core::walk`) into `files` and every `*.meta.json` into
+  `content`/`meta_kv`. `sync_dir`/`sync_meta` apply incremental updates. `query`
+  builds dynamic SQL: substring on name, prefix on hash, range scans on
+  size/mtime, and an `EXISTS` join on `meta_kv` per tag filter.
+- **Watcher (`watcher.rs`)** — a `notify` debounced watcher over the roots (for
+  `.hashit`) and the meta folder (for `*.meta.json`). A `.hashit` change re-syncs
+  that directory's files; a `<hash>.meta.json` change re-syncs that hash's
+  content/tags. Thumbnail/preview JPEGs are ignored — they aren't searchable.
+- **Search service (`search.rs`)** — a thin tonic mapping from
+  `hashit.search.v1.Search` (`Query`, `Stats`) to `store` calls. The store sits
+  behind an `Arc<Mutex<…>>` shared with the watcher thread; queries are synchronous
+  and never hold the lock across an `.await`.
 
-## Command flows
+## gRPC contracts
 
-- **inventory** — walk `.hashit` files, flatten entries into sorted
-  `InventoryRecord`s, render JSON or CSV.
-- **watch** — initial `scan`, then a `notify` debounced watcher; each event
-  batch maps to a set of affected directories that are re-run through
-  `process_dir`. Own writes (`.hashit`, `._*`) are filtered to avoid feedback
-  loops.
-- **dedup** — `scan`, build `(algo,hash) → files`, and for each duplicate set
-  pick a keeper (auto rank: non-hidden → fewest `/` → alphabetical; or
-  interactive). Removed files get a relative `<file>.dedup` pointer; affected
-  dirs are reconciled.
-- **diff** — `scan` both sides (to stderr), build a `HashIndex` per side
-  (`collect`), compute only-in-A / only-in-B / common, render in the chosen
-  format. `--no-scan` compares existing manifests as-is.
-- **sync** — `scan` both, index both, copy files whose hash is absent from the
-  target at the source-relative path (`_N` suffix on collision). The source's
-  manifest entry is **carried** to the target (hash kept; size/mtime re-read so
-  the entry matches the stored file). Affected dirs are seeded then reconciled.
-- **cp/mv/rm** (`fileops.rs`) — `scan_sources` first (directories recursively,
-  file parents via `process_dir`). `cp`/`mv` carry source entries into target
-  manifests; `mv` of a directory uses `rename` (its `.hashit` travels along),
-  falling back to copy-tree + remove across filesystems; `rm` drops the source
-  entry. `finalize` seeds carried entries and reconciles affected dirs with
-  `process_dir` (reuses carried hashes, hashes only files lacking an entry).
+Defined under `proto/` and compiled by each binary's `build.rs` using a vendored
+`protoc` (`protoc-bin-vendored`), so no system protobuf compiler is required:
 
-## Metadata index (optional `extract` feature)
+- `proto/fileops.proto` → `hashit.fileops.v1.FileOps` (server in `hashit`).
+- `proto/search.proto` → `hashit.search.v1.Search` (server in `hashit-idx`).
 
-A second, **derived** layer sits on top of the manifests: a global, drive-aware
-index for rich metadata, keyed by content hash rather than path.
-
-- **Store (`store.rs`)** — one SQLite database at `~/.hashit/index.db`
-  (`$HASHIT_HOME` overrides; WAL + a `schema_meta` version row for migrations)
-  with a sibling `cache/` for thumbnails. Tables: `drives`, `content` (one row
-  per `(algo, hash)`), `metadata` (EAV: `key`/`value`, indexed for reverse
-  lookups), `locations` (one row per `(algo, hash, drive, path)`), `tags`
-  (user tags/favorites, keyed by hash), and `link_members` (hash → link group).
-  Everything except user tags/links is rebuildable from the `.hashit` manifests,
-  so corruption is recovered by re-indexing; tags and links are user-authored
-  state and key by content hash, so they apply to every copy.
-- **Drives (`drive.rs`)** — each root carries a `.hashit-drive` marker (a UUID +
-  label, written atomically like a manifest). The UUID is the stable `drive_id`;
-  it travels with the drive (works on exFAT, unlike volume UUIDs). Presence is
-  probed by checking the marker at a drive's last known root, so content can be
-  flagged offline or a drive permanently detached (purging its locations and any
-  now-orphaned content/metadata/thumbnails).
-- **Extraction (`extract/`)** — `extract_all` identifies a file from a header
-  read (`exiftool_rs::filetype`), and for images pulls EXIF (`exiftool_rs`) and a
-  downscaled JPEG thumbnail (`magick-codecs`/`magick-core`). Designed as
-  swappable free functions so an external-tool fallback can be added later.
-- **Orchestration (`index.rs`)** — `index` scans, then walks the manifests
-  (reusing `inventory::build_inventory`) and reconciles the store: a hash new to
-  the store is extracted **once** (in parallel), and every file's location is
-  upserted; stale locations on the drive are pruned. `Indexer::reconcile_dir`
-  does the same for a single directory and is driven by `watch --index` via a
-  callback, so live filesystem activity updates the index incrementally.
-
-- **Tags & links (`store.rs`, CLI in `main.rs`)** — `tag`/`fav` attach
-  hash-keyed user tags (favorites are the reserved `favorite` tag); `link` groups
-  related hashes (e.g. a JPG + its RAW), with `link --auto` detecting same-stem,
-  different-extension sidecars via `index::auto_link_groups`. Linking overlapping
-  sets merges their groups; unlinking down to one member dissolves the group.
-  Both are index-only (never written back to the original files).
-
-The core `scan`/manifest path is untouched by all of this — the index is
-additive and entirely behind the `extract` feature, which also gates its heavier
-dependencies (SQLite, the metadata/image crates).
-
-## Headless API (optional `serve` feature)
-
-`hashit serve` exposes the index as a read-only logical filesystem over HTTP.
-hashit ships no UI; an external web app is meant to be built on top.
-
-- **`api.rs`** is the contract: typed, transport-agnostic operations over the
-  store — `drives`, `list_dir`/`stat` (a per-drive directory tree synthesized
-  from `locations.path`), `query`, `content_source`, `detail`, and `thumb`
-  (generate-on-demand). A Rust consumer can call these directly.
-- **`serve.rs`** is a thin axum layer: `/v1/{drives,ls,stat,query,content/:hash,
-  content/:hash/meta,thumb/:hash}`. It binds localhost, guards requests with a
-  bearer token (header or `?token=`), and sets permissive CORS so a browser app
-  on another origin can call it. Each request opens the index on a blocking
-  thread (SQLite WAL → concurrent readers), so no connection is held across an
-  `.await`. Directory listings use a path-prefix **range scan**
-  (`path >= prefix AND path < prefix‖+1`) plus SQL `substr`/`instr` to compute
-  immediate children — no full-subtree materialization.
-
-  Mutating endpoints (tag/favorite, link/unlink, and dedup "keep this") are
-  opt-in via `--allow-write` (else `403`) and route through the same `api.rs`
-  ops, reusing `dedup::remove_one` + `scan::process_dir` so deletions update the
-  `.hashit` manifests and the index together; the dedup call requires an explicit
-  `confirm` and skips offline copies.
-
-The `serve` feature implies `extract` and adds the async HTTP stack
-(`tokio`, `axum`, `tower-http`); the default build does not include it.
+Both services bind to `127.0.0.1` only.
 
 ## Key invariants
 
 - A `.hashit` describes only the files directly in its directory; recursion is
-  implicit via one manifest per directory. Parent manifests never list subdirs,
-  so moving/removing a whole directory needs no parent-manifest update.
-- Carried entries always re-read the on-disk size/mtime so a later scan sees the
-  file as `unchanged` and does not re-hash — verified to hold even on exFAT,
-  whose coarse mtime resolution would otherwise force a rehash.
-- Hash grouping is by `(algo, hash)` so different algorithms never collide.
-
-## Dependencies
-
-`clap` (CLI), `serde`/`serde_json` (manifest + JSON), `blake3` + `sha2`/`hex`
-(hashing), `walkdir` (traversal), `notify` + `notify-debouncer-full` (watch),
-`rayon` (parallel hashing), `glob` (excludes), `csv`, `chrono` (timestamps),
-`anyhow` (errors).
-
-Behind the optional `extract` feature: `rusqlite` (bundled SQLite), `uuid` (drive
-ids), and the local `exiftool_rs` + `magick-core`/`magick-codecs` crates
-(metadata + thumbnails).
+  implicit via one manifest per directory, so moving/removing a whole directory
+  needs no parent-manifest update.
+- Carried entries (cp/mv) re-read on-disk size/mtime so a later scan sees the file
+  as `unchanged` and doesn't re-hash — holds even on exFAT's coarse mtime.
+- Metadata and the index are keyed by `(algo, hash)`, so different algorithms
+  never collide and identical content shares one metadata record.
+- The metadata folder and the index are derived data: delete and regenerate at
+  will. Only user-authored `properties` in `meta.json` are irrecoverable state.

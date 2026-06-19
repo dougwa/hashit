@@ -1,41 +1,35 @@
 # hashit
 
-A fast, cross-platform CLI for inventorying files by content hash. `hashit`
-maintains a small `.hashit` manifest in every directory it scans, recording each
-file's size, modified time, and BLAKE3 (or SHA-256) hash. From those manifests it
-can produce inventories, watch for changes in real time, find and remove
-duplicates, diff two trees by content, sync missing files between trees, and
-perform hash-aware `cp`/`mv`/`rm`.
+A fast, cross-platform toolset for inventorying files by content hash, split
+into two focused binaries:
 
-On top of those manifests it can also build a **global metadata index**: a
-hash-keyed SQLite database that extracts file metadata (EXIF, file type) and
-thumbnails **once per content hash**, tracks which drive each copy lives on
-(flagging content offline when a drive is unplugged), and answers fast,
-paginated queries by type, extension, or metadata. See
-[Metadata index](#metadata-index-indexquerydrivethumb).
+- **`hashit`** — the command-line scanner. It maintains a small `.hashit`
+  manifest in every directory it touches (recording each file's size, modified
+  time, and BLAKE3 or SHA-256 hash), does hash-aware `cp`/`mv`/`rm`, and can
+  generate per-content metadata artifacts (thumbnails, previews, EXIF tags).
+- **`hashit-idx`** — a read-only daemon that builds a global, searchable SQLite
+  index from the `.hashit` manifests and metadata files, keeps it fresh by
+  watching for changes, and serves search over a localhost-only gRPC endpoint.
 
-Built in Rust. Hashing is parallel; the binary is self-contained.
+The division of labour: `hashit` only ever works with individual files under the
+roots you give it and is the **only** writer. `hashit-idx` provides the
+**global view** (search across everything) and never modifies anything.
 
-## Build
+Built in Rust as a cargo workspace. Hashing is parallel; metadata extraction
+runs once per content hash.
+
+## Workspace layout
+
+| Crate | Role |
+|-------|------|
+| `hashit-core` | Portable `.hashit` manifest model, hashing, scan engine, file ops, and the per-hash metadata file format. Dependency-light; shared by both binaries. |
+| `hashit-extract` | Extraction engine: file-type detection, EXIF tags, thumbnails, previews (`exiftool_rs` + `magick-*`). Used only by `hashit`. |
+| `hashit` | The scanner CLI binary. |
+| `hashit-idx` | The index + gRPC search daemon binary. |
 
 ```sh
 cargo build --release
-# binary at target/release/hashit
-```
-
-The metadata index lives behind the default-on `extract` cargo feature (it pulls
-in SQLite and the metadata/thumbnail extractors). To build the lean core CLI
-without it — and without those dependencies — disable default features:
-
-```sh
-cargo build --release --no-default-features
-```
-
-The headless HTTP API (`hashit serve`) is behind the (non-default) `serve`
-feature, which pulls in an async HTTP stack:
-
-```sh
-cargo build --release --features serve
+# binaries at target/release/{hashit,hashit-idx}
 ```
 
 ## How it works
@@ -46,7 +40,7 @@ in that directory:
 ```json
 {
   "version": 1,
-  "updated_at": "2026-05-29T14:07:50.265Z",
+  "updated_at": "2026-06-19T14:07:50.265Z",
   "files": {
     "photo.jpg": {
       "size": 1048576,
@@ -54,23 +48,40 @@ in that directory:
       "hash": "a1c3d13f…",
       "algo": "blake3",
       "flags": ["executable"],
-      "hashed_at": "2026-05-29T14:07:50.265Z"
+      "hashed_at": "2026-06-19T14:07:50.265Z"
     }
   }
 }
 ```
 
-**Recompute heuristic** — hashing is expensive, so a file is only re-hashed when:
-its size changed, or its size is unchanged but the modified time changed (or the
-hash algorithm changed, or it's new). Otherwise the stored hash is reused. A
+**Recompute heuristic** — hashing is expensive, so a file is only re-hashed
+when: it's new, its size changed, its size is unchanged but the modified time
+changed, or the hash algorithm changed. Otherwise the stored hash is reused. A
 re-scan of an unchanged tree writes nothing.
 
-**Managed/metadata files are skipped** and never inventoried: `.hashit` (and its
-`.hashit.tmp.*` temp files), `.hashit-drive` (the per-drive id marker), `*.dedup`
-pointers, and macOS AppleDouble `._*` sidecars (use `--include-apple-double` to
-include the latter). Symlinks are skipped unless `--follow-symlinks` is given.
+**Managed/metadata files are skipped** and never hashed: `.hashit` (and its
+`.hashit.tmp.*` temp files), `*.dedup` pointers, and macOS AppleDouble `._*`
+sidecars (use `--include-apple-double` to include the latter). Symlinks are
+skipped unless `--follow-symlinks` is given.
 
-## Commands
+## Per-hash metadata
+
+Metadata artifacts live as plain files in a single, shared folder
+(`--meta-folder`, default `$HASHIT_META` or `~/.hashit-meta`), keyed by content
+hash and sharded by hash prefix so one directory never holds millions of files:
+
+```text
+<meta-folder>/1a/fa/1afaef….meta.json      structured: EXIF tags + user properties
+<meta-folder>/1a/fa/1afaef….thumbnail.jpg  512px thumbnail
+<meta-folder>/1a/fa/1afaef….preview.jpg    2048px preview
+```
+
+Everything here is **derived** and rebuildable, except user-authored
+`properties` (set via `put-meta`), which are the only state that can't be
+recovered from the original files. Because metadata is keyed by content hash, it
+is computed once per unique file and applies to every duplicate copy.
+
+## `hashit` commands
 
 ### scan — build/update manifests
 
@@ -78,71 +89,25 @@ include the latter). Symlinks are skipped unless `--follow-symlinks` is given.
 hashit scan <path>... [--hash blake3|sha256] [--workers N] [--exclude GLOB]...
                       [--follow-symlinks] [--include-apple-double]
                       [--status] [-v|--verbose] [-q|--quiet] [--dry-run]
+                      [--meta-thumbnail] [--meta-preview] [--meta-tags] [--meta-all]
+                      [--meta-folder PATH]
 ```
 
-Traverses each `path`, updating every directory's `.hashit`. Removes entries for
-files that no longer exist. `--status` prints a `new`/`modified`/`unchanged`/`removed`
-line per file; `--dry-run` reports changes without writing. Pass several paths to
-scan multiple roots in one run (the summary is combined).
-
-### inventory — one aggregated report
-
-```sh
-hashit inventory <path>... [--format json|csv] [-o|--output FILE]
-```
-
-Walks all `.hashit` files under each `path` and emits a single sorted report
-(relative path, hash, flags, size, timestamps) to stdout or a file. With multiple
-paths the records are merged into one report.
+Traverses each `path`, updating every directory's `.hashit` and removing entries
+for files that no longer exist. The `--meta-*` flags run an extract-once-per-hash
+pass after the scan, generating any missing artifacts into the metadata folder
+(`--meta-all` = thumbnail + preview + tags).
 
 ### watch — real-time updates
 
 ```sh
-hashit watch <path>... [scan options] [--debounce-ms 500]
+hashit watch <path>... [scan/meta options] [--debounce-ms 500] [--serve [ADDR]]
 ```
 
-Runs a scan, then watches each path recursively and updates `.hashit` files as
-files are added, changed, or removed.
-
-### dedup — remove duplicate content
-
-```sh
-hashit dedup <path>... (-i|--interactive | -a|--auto) [--no-dedup-link] [--dry-run]
-```
-
-Scans, groups files by hash, then resolves each duplicate set. Pass several paths
-to find duplicates **across** roots (e.g. between two drives); matches are then
-shown by absolute path.
-- `-a/--auto` keeps the best file: **non-hidden first, then fewest `/`, then
-  alphabetical**, removing the rest.
-- `-i/--interactive` prompts per set: a number to keep, `s` to skip, `a` to
-  switch to auto for the rest.
-- Each removed duplicate leaves a `<file>.dedup` pointer containing the path to
-  the kept file, relative to the removed file's directory (suppress with
-  `--no-dedup-link`).
-
-### diff — compare two trees by content
-
-```sh
-hashit diff <path1> <path2> [--format grouped|unified|json|summary]
-                            [--show-common] [--no-scan]
-```
-
-Reports which content hashes are unique to each side (paths don't matter, so a
-renamed/moved file counts as common). Default format is `grouped`. Scan progress
-goes to stderr so `--format json` pipes cleanly.
-
-### sync — copy missing files between trees
-
-```sh
-hashit sync <path1> <path2> [-d|--direction to|from|both] [--no-scan] [--dry-run]
-```
-
-Copies files whose content is missing from the target, placing each at its
-source-relative path. `to` (default) copies path1→path2, `from` copies
-path2→path1, `both` copies each way. Name collisions get a `_N` suffix (never
-overwrites). The source's `.hashit` details are carried to the target so copied
-content isn't re-hashed.
+Runs a scan, then watches each path recursively and updates `.hashit` files (and,
+with `--meta-*`, metadata artifacts) as files change. With `--serve` it also runs
+a localhost-only gRPC **FileOps** server (default `127.0.0.1:50552`) exposing
+`cp`/`mv`/`rm`/`get-meta`/`put-meta` — handy for a local UI to drive mutations.
 
 ### cp / mv / rm — hash-aware file operations
 
@@ -154,138 +119,59 @@ hashit rm [-r] [-f] <path>...
 
 Patterned after their POSIX cousins. `-r` recurses into directories (required by
 `cp`/`rm`; `mv` moves directories regardless). `-f` overwrites an existing target
-(`cp`/`mv`) or ignores missing files (`rm`). Sources are always scanned first.
-- `cp`/`mv` carry the source's hash into the target's `.hashit` (no re-hash).
-- `mv` of a directory uses `rename`, so its `.hashit` files travel with it.
-- `rm` removes the entry from the source folder's `.hashit`.
+(`cp`/`mv`) or ignores missing files (`rm`). `cp`/`mv` carry the source's hash
+into the target's `.hashit` (no re-hash); `mv` of a directory uses `rename` so
+its `.hashit` files travel with it.
 
-## Metadata index (index/query/drive/thumb)
-
-*(Requires the default-on `extract` feature.)* These commands maintain a global,
-drive-aware index at `~/.hashit/index.db` (override the location with
-`$HASHIT_HOME`), with thumbnails cached under `~/.hashit/cache/`. Metadata and
-thumbnails are computed **once per content hash**, so duplicates cost nothing and
-custom data will apply to every copy. The index is **derived** from the `.hashit`
-manifests and is safe to delete and rebuild.
-
-Each scanned root gets a `.hashit-drive` marker holding a generated drive id (it
-travels with the drive — works on exFAT, unlike volume UUIDs). The index records
-every `(drive, path)` a hash appears at, so content can be flagged offline when a
-drive is unplugged, or purged when a drive is permanently detached.
-
-### index — scan, then extract + index
+### get-meta / put-meta — inspect and edit metadata
 
 ```sh
-hashit index <path>... [scan options] [--no-scan] [--reindex]
+hashit get-meta <path>... [--meta-folder PATH]
+hashit put-meta <path>... [--set KEY=VALUE]... [--remove KEY]... [--meta-folder PATH]
 ```
 
-Scans (unless `--no-scan`), then reconciles the global index: new content hashes
-have their metadata (EXIF via a built-in ExifTool-compatible reader) and a
-thumbnail extracted; every file's location is recorded. `--reindex` re-extracts
-content already known.
+`get-meta` resolves each path to its content hash and prints (as JSON) the
+extracted tags, user properties, and the thumbnail/preview paths if those
+artifacts exist. `put-meta` sets or removes user properties. Both operate **by
+content hash**, so an edit applies to every copy of that content.
 
-### query — search the index
+## `hashit-idx` — global index + search
 
 ```sh
-hashit query [--type CATEGORY] [--ext EXT] [--hash PREFIX] [--drive ID]
-             [--offline] [--key K [--value V]] [--limit N] [--offset N]
-             [--format json|csv] [-o FILE]
+hashit-idx <root>... [--meta-folder PATH] [--db PATH] [--addr 127.0.0.1:50551]
+                     [--debounce-ms 500]
 ```
 
-Paginated, server-side queries grouped by content hash. Filter by coarse type
-(`--type image`), extension (`--ext cr2`), hash prefix, drive, presence
-(`--offline` = no copy on a currently-online drive), a metadata key/value
-(`--key Model --value "Canon EOS R5"`), a user tag (`--tag sunset`), or favorites
-(`--favorite`). Each row includes its tags and link group. Reads only a page at a
-time, so it scales to very large indexes.
+Builds a SQLite index (default `$HASHIT_HOME/index.db` or `~/.hashit/index.db`)
+from the `.hashit` manifests under each root and the `*.meta.json` files in the
+metadata folder, then watches both for changes to keep it current. The index is
+fully rebuildable from disk and is never written to by anything but `hashit-idx`.
 
-### drive — manage indexed drives
+It serves a read-only **Search** gRPC service on localhost
+(`proto/search.proto`):
+
+- `Query` — filter by name (substring), hash (prefix), size range, modified-time
+  range, and tag/property key(+value); paginated.
+- `Stats` — index-wide counts (files, hashes, tag/property rows).
+
+Because the service is gRPC, point any gRPC client at it. Example with
+[`grpcurl`](https://github.com/fullstorydev/grpcurl) using the proto directly
+(no server reflection needed):
 
 ```sh
-hashit drive list                      # id, online/offline, label, file count, root
-hashit drive detach <drive-id>         # purge a drive's locations + orphaned metadata
-hashit drive relabel <drive-id> <name>
+grpcurl -plaintext -import-path proto -proto search.proto \
+  -d '{"name":"sunset","min_size":100000}' \
+  127.0.0.1:50551 hashit.search.v1.Search/Query
 ```
 
-### thumb — get a thumbnail
+## gRPC services
 
-```sh
-hashit thumb <hash-or-prefix>          # prints the cached thumbnail path (generating it if missing)
-```
+Two localhost-only services, defined under `proto/`:
 
-### tag / fav — custom tags and favorites
-
-```sh
-hashit tag add <hash> <tag>...         # attach one or more tags
-hashit tag rm  <hash> <tag>...         # remove tags
-hashit tag ls  <hash>                  # list a hash's tags
-hashit fav <hash>                      # mark a favorite (the "favorite" tag)
-hashit unfav <hash>
-```
-
-Tags are stored in the index **by content hash**, so they apply to every copy of
-that content across all drives, and survive moves. (Tags live only in the index;
-they are not written back into the original files.) Filter with
-`hashit query --tag <tag>` or `--favorite`.
-
-### link — logically group related files
-
-```sh
-hashit link <hash> <hash>...           # link two or more hashes (e.g. a JPG + its RAW)
-hashit link --auto <path>...           # auto-link sidecars: same basename, different extension
-hashit links <hash>                    # show a hash's link group
-hashit unlink <hash>                   # remove a hash from its group
-```
-
-Links are also keyed by content hash. `--auto` pairs files in the same directory
-that share a basename but differ in extension (e.g. `IMG_0001.JPG` +
-`IMG_0001.CR2`). Linking sets that overlap are merged into one group; removing a
-member that would leave a single file dissolves the group.
-
-`watch` also accepts `--index` to keep the index in sync with live filesystem
-changes as it updates manifests.
-
-## Headless API (`serve`)
-
-*(Requires the `serve` feature: `cargo build --features serve`.)* `hashit serve`
-exposes the index as a small, **read-only HTTP/JSON API** — a low-level logical
-filesystem over your drives. hashit ships **no UI**; build a web app (any
-framework) on top of this API.
-
-```sh
-hashit serve [--host 127.0.0.1] [--port 8087] [--token TOKEN | --no-token] [--allow-write]
-```
-
-Binds to localhost by default and requires a bearer token (printed at startup,
-or set with `--token`; pass it as `Authorization: Bearer <t>` or `?token=<t>`).
-CORS is permissive so a browser app on another origin can call it. The full
-contract is in [`docs/openapi.yaml`](docs/openapi.yaml) (OpenAPI 3.0).
-
-Read endpoints (all under `/v1`):
-
-| Method & path | Returns |
-|---|---|
-| `GET /v1/drives` | indexed drives + online/offline status |
-| `GET /v1/ls?drive=&path=` | immediate children of a logical directory (`path=""` = root) |
-| `GET /v1/stat?drive=&path=` | one entry (file summary or directory) |
-| `GET /v1/query?type=&ext=&tag=&favorite=&drive=&offline=&key=&value=&hash=&limit=&offset=` | paginated reverse-index query |
-| `GET /v1/content/:hash` | streams the file's bytes |
-| `GET /v1/content/:hash/meta` | metadata, locations, tags, and links for a hash |
-| `GET /v1/thumb/:hash` | the thumbnail (generated on demand if missing) |
-
-Write endpoints — only available with `--allow-write` (otherwise `403`):
-
-| Method & path | Effect |
-|---|---|
-| `POST /v1/content/:hash/tags` `{"tags":[...]}` | add tags |
-| `DELETE /v1/content/:hash/tags/:tag` | remove a tag |
-| `POST` / `DELETE /v1/content/:hash/favorite` | set / clear favorite |
-| `POST /v1/links` `{"hashes":[...]}` | link hashes (returns the group id) |
-| `DELETE /v1/links/:hash` | unlink a hash |
-| `POST /v1/content/:hash/dedup` `{"keep_drive","keep_path","confirm":true}` | keep one copy, delete the others (leaving `.dedup` pointers) |
-
-The dedup endpoint **deletes files** and requires `"confirm": true` (else `400`);
-offline copies are skipped. Mutations are index-keyed by hash, matching the CLI.
+| Service | Served by | Purpose |
+|---------|-----------|---------|
+| `hashit.fileops.v1.FileOps` | `hashit watch --serve` | mutations: cp/mv/rm/get-meta/put-meta |
+| `hashit.search.v1.Search` | `hashit-idx` | read-only search + stats |
 
 ## Common options
 
@@ -294,6 +180,7 @@ offline copies are skipped. Mutations are index-keyed by hash, matching the CLI.
 | `--hash blake3\|sha256` | Hash algorithm (default `blake3`) |
 | `--workers N` | Hashing threads (`0` = number of CPUs) |
 | `--exclude GLOB` | Exclude matching files/dirs (repeatable) |
+| `--ignore STR` | Ignore paths containing a substring (repeatable, `$HASHIT_IGNORE`) |
 | `--follow-symlinks` | Follow symlinks instead of skipping |
 | `--include-apple-double` | Include macOS `._*` sidecars |
 | `-q/--quiet` | Suppress per-file/progress output |
@@ -306,4 +193,5 @@ offline copies are skipped. Mutations are index-keyed by hash, matching the CLI.
   mtime resolution (e.g. exFAT) the stored time is re-read so manifests stay
   consistent.
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the internal design.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the internal design and
+[ROADMAP.md](ROADMAP.md) for status and what's next.
