@@ -1,0 +1,62 @@
+syntax = "proto3";
+
+// Read-only search over the hashit-idx index. Served locally over gRPC; all
+// mutations happen through `hashit`, never here.
+package hashit.search.v1;
+
+service Search {
+  // Find indexed files matching the given filters.
+  rpc Query(QueryRequest) returns (QueryResponse);
+  // Index-wide counts, useful for health checks and verification.
+  rpc Stats(StatsRequest) returns (StatsResponse);
+}
+
+message TagFilter {
+  // Tag/property key (e.g. "EXIF:Model" or a user property like "rating").
+  string key = 1;
+  // Required value; empty matches any value for the key.
+  string value = 2;
+}
+
+message QueryRequest {
+  // Case-insensitive substring match on the file basename.
+  string name = 1;
+  // Hash prefix (or full hash).
+  string hash = 2;
+  // Inclusive size bounds in bytes (0 = unset).
+  uint64 min_size = 3;
+  uint64 max_size = 4;
+  // Inclusive modified-time bounds, RFC3339 (empty = unset).
+  string min_date = 5;
+  string max_date = 6;
+  // Tag/property filters; all must match (AND).
+  repeated TagFilter tags = 7;
+  // Pagination. limit 0 means "server default".
+  uint32 limit = 8;
+  uint32 offset = 9;
+}
+
+message FileResult {
+  string path = 1;
+  string name = 2;
+  string hash = 3;
+  string algo = 4;
+  uint64 size = 5;
+  string mtime = 6;       // RFC3339
+  string file_type = 7;   // e.g. "image" (empty if unknown)
+  string ext = 8;
+}
+
+message QueryResponse {
+  repeated FileResult files = 1;
+  // Total matches before limit/offset.
+  uint64 total = 2;
+}
+
+message StatsRequest {}
+
+message StatsResponse {
+  uint64 files = 1;
+  uint64 hashes = 2;
+  uint64 tags = 3;
+}
