@@ -20,3 +20,10 @@ serde.workspace = true
 serde_json.workspace = true
 notify.workspace = true
 notify-debouncer-full.workspace = true
+prost.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+
+[build-dependencies]
+tonic-build.workspace = true
+protoc-bin-vendored.workspace = true

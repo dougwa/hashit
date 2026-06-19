@@ -1,0 +1,67 @@
+syntax = "proto3";
+
+// Local mutation API exposed by `hashit watch --serve`. All operations route
+// through the same core file ops and metadata code as the CLI, so manifests and
+// metadata files stay consistent. Served on localhost only.
+package hashit.fileops.v1;
+
+service FileOps {
+  rpc Cp(CpRequest) returns (OpResponse);
+  rpc Mv(MvRequest) returns (OpResponse);
+  rpc Rm(RmRequest) returns (OpResponse);
+  rpc GetMeta(GetMetaRequest) returns (GetMetaResponse);
+  rpc PutMeta(PutMetaRequest) returns (OpResponse);
+}
+
+message CpRequest {
+  repeated string sources = 1;
+  string dest = 2;
+  bool recursive = 3;
+  bool force = 4;
+}
+
+message MvRequest {
+  repeated string sources = 1;
+  string dest = 2;
+  bool force = 3;
+}
+
+message RmRequest {
+  repeated string paths = 1;
+  bool recursive = 2;
+  bool force = 3;
+}
+
+message OpResponse {
+  string message = 1;
+}
+
+message GetMetaRequest {
+  repeated string paths = 1;
+}
+
+message MetaEntry {
+  string path = 1;
+  string error = 2;
+  string hash = 3;
+  string algo = 4;
+  uint64 size = 5;
+  string file_type = 6;
+  string ext = 7;
+  map<string, string> tags = 8;
+  map<string, string> properties = 9;
+  string thumbnail = 10;
+  string preview = 11;
+}
+
+message GetMetaResponse {
+  repeated MetaEntry entries = 1;
+}
+
+message PutMetaRequest {
+  repeated string paths = 1;
+  // Properties to set (KEY -> VALUE).
+  map<string, string> set = 2;
+  // Property keys to remove.
+  repeated string remove = 3;
+}

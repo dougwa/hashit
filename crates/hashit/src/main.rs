@@ -6,21 +6,25 @@
 //! under the roots it is given.
 
 mod meta_pass;
+mod metacmd;
+mod serve;
 mod watch;
 
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+#[allow(dead_code)] // the generated client is only used by tests.
+mod pb_fileops {
+    tonic::include_proto!("hashit.fileops.v1");
+}
+
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use glob::Pattern;
-use serde::Serialize;
 
 use hashit_core::fileops::{self, OpOptions};
 use hashit_core::hash::HashAlgo;
-use hashit_core::manifest::ManifestCache;
-use hashit_core::meta::{self, MetaFile};
+use hashit_core::meta;
 use hashit_core::scan::{self, ScanOptions, ScanStats};
 use meta_pass::MetaOptions;
 
@@ -148,6 +152,10 @@ struct WatchArgs {
     /// Debounce window in milliseconds for coalescing filesystem events.
     #[arg(long, default_value_t = 500)]
     debounce_ms: u64,
+    /// Also run a localhost-only gRPC FileOps server (cp/mv/rm/get-meta/put-meta).
+    /// Optional bind address; defaults to 127.0.0.1:50552.
+    #[arg(long, value_name = "ADDR", num_args = 0..=1, default_missing_value = "127.0.0.1:50552")]
+    serve: Option<std::net::SocketAddr>,
 }
 
 #[derive(Args)]
@@ -303,6 +311,44 @@ fn set_workers(n: usize) {
     }
 }
 
+/// Regenerate metadata artifacts for one changed directory (the `watch` hook).
+fn run_dir_meta(mopts: &Option<MetaOptions>, dir: &std::path::Path, quiet: bool) {
+    if let Some(m) = mopts {
+        if let Err(e) = meta_pass::run_for_dir(dir, m) {
+            if !quiet {
+                eprintln!("hashit: meta update failed for {}: {e:#}", dir.display());
+            }
+        }
+    }
+}
+
+/// Run the watcher (on a background thread, since it blocks) and the gRPC
+/// FileOps server (on this thread's async runtime) concurrently.
+#[allow(clippy::too_many_arguments)]
+fn watch_serve(
+    roots: Vec<PathBuf>,
+    opts: ScanOptions,
+    mopts: Option<MetaOptions>,
+    debounce_ms: u64,
+    addr: std::net::SocketAddr,
+    meta_folder: PathBuf,
+    algo: HashAlgo,
+) -> Result<()> {
+    let quiet = opts.quiet;
+    std::thread::spawn(move || {
+        if let Err(e) = watch::watch(&roots, &opts, debounce_ms, move |_, dir| {
+            run_dir_meta(&mopts, dir, quiet);
+        }) {
+            eprintln!("hashit: watch stopped: {e:#}");
+        }
+    });
+    if !quiet {
+        println!("serving gRPC FileOps on {addr} (localhost only)");
+    }
+    let rt = tokio::runtime::Runtime::new().context("starting async runtime")?;
+    rt.block_on(serve::serve(addr, serve::ServeConfig { meta_folder, algo }))
+}
+
 /// Minimal scan options for the file ops (cp/mv/rm): they only need the algo
 /// for reconciling affected manifests, and quiet to gate output.
 fn fileop_scan_opts(hash: HashAlgo, quiet: bool, ignores: Vec<String>) -> ScanOptions {
@@ -350,15 +396,24 @@ fn run(cli: Cli) -> Result<()> {
             if let Some(m) = &mopts {
                 meta_pass::run(&a.common.roots, m, opts.quiet)?;
             }
-            watch::watch(&a.common.roots, &opts, a.debounce_ms, |_, dir| {
-                if let Some(m) = &mopts {
-                    if let Err(e) = meta_pass::run_for_dir(dir, m) {
-                        if !opts.quiet {
-                            eprintln!("hashit: meta update failed for {}: {e:#}", dir.display());
-                        }
-                    }
-                }
-            })
+            if let Some(addr) = a.serve {
+                let meta_folder = meta::resolve_meta_folder(a.meta.meta_folder.clone());
+                watch_serve(
+                    a.common.roots.clone(),
+                    opts,
+                    mopts,
+                    a.debounce_ms,
+                    addr,
+                    meta_folder,
+                    a.common.hash,
+                )
+            } else {
+                let roots = a.common.roots.clone();
+                let quiet = opts.quiet;
+                watch::watch(&roots, &opts, a.debounce_ms, move |_, dir| {
+                    run_dir_meta(&mopts, dir, quiet);
+                })
+            }
         }
         Command::Cp(a) => {
             set_workers(a.workers);
@@ -395,78 +450,9 @@ fn run(cli: Cli) -> Result<()> {
     }
 }
 
-/// Resolve a file to its recorded `(hash, algo, size)` from the manifest in its
-/// parent directory. Errors if the file isn't recorded yet.
-fn entry_for(cache: &mut ManifestCache, path: &Path) -> Result<(String, String, u64)> {
-    match cache.entry_for(path) {
-        Some(e) => Ok((e.hash, e.algo, e.size)),
-        None => bail!(
-            "{}: no .hashit entry found; run `hashit scan` on its directory first",
-            path.display()
-        ),
-    }
-}
-
-/// One path's metadata in the `get-meta` JSON output. Absent fields are omitted;
-/// a lookup failure is reported via `error`.
-#[derive(Default, Serialize)]
-struct MetaView {
-    path: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    hash: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    algo: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    size: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    file_type: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ext: Option<String>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    tags: BTreeMap<String, String>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    properties: BTreeMap<String, String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    thumbnail: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    preview: Option<String>,
-}
-
 fn get_meta(a: &GetMetaArgs) -> Result<()> {
     let folder = meta::resolve_meta_folder(a.meta_folder.clone());
-    let mut cache = ManifestCache::default();
-    let mut out: Vec<MetaView> = Vec::with_capacity(a.paths.len());
-    for path in &a.paths {
-        let mut view = MetaView {
-            path: path.display().to_string(),
-            ..Default::default()
-        };
-        match entry_for(&mut cache, path) {
-            Err(e) => view.error = Some(format!("{e:#}")),
-            Ok((hash, algo, size)) => {
-                if let Some(m) = MetaFile::load(&folder, &hash)? {
-                    view.file_type = m.file_type;
-                    view.ext = m.ext;
-                    view.tags = m.tags;
-                    view.properties = m.properties;
-                }
-                let thumb = meta::thumbnail_path(&folder, &hash);
-                if thumb.exists() {
-                    view.thumbnail = Some(thumb.display().to_string());
-                }
-                let preview = meta::preview_path(&folder, &hash);
-                if preview.exists() {
-                    view.preview = Some(preview.display().to_string());
-                }
-                view.hash = Some(hash);
-                view.algo = Some(algo);
-                view.size = Some(size);
-            }
-        }
-        out.push(view);
-    }
+    let out = metacmd::gather(&folder, &a.paths)?;
     println!("{}", serde_json::to_string_pretty(&out)?);
     Ok(())
 }
@@ -475,43 +461,12 @@ fn put_meta(a: &PutMetaArgs) -> Result<()> {
     if a.set.is_empty() && a.remove.is_empty() {
         bail!("put-meta: nothing to do (pass --set KEY=VALUE and/or --remove KEY)");
     }
-    // Parse KEY=VALUE pairs up front so a malformed one fails before any write.
-    let sets: Vec<(String, String)> = a
-        .set
-        .iter()
-        .map(|kv| match kv.split_once('=') {
-            Some((k, v)) if !k.is_empty() => Ok((k.to_string(), v.to_string())),
-            _ => bail!("invalid --set value (expected KEY=VALUE): {kv}"),
-        })
-        .collect::<Result<_>>()?;
-
+    let sets = metacmd::parse_sets(&a.set)?;
     let folder = meta::resolve_meta_folder(a.meta_folder.clone());
-    let mut cache = ManifestCache::default();
-    // Metadata is keyed by content hash, so edit each unique hash once even if
-    // several of the given paths share it.
-    let mut done: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for path in &a.paths {
-        let (hash, algo, size) = entry_for(&mut cache, path)?;
-        if !done.insert(hash.clone()) {
-            continue;
-        }
-        let mut m = MetaFile::load(&folder, &hash)?.unwrap_or_default();
-        m.hash = hash.clone();
-        if m.algo.is_empty() {
-            m.algo = algo;
-        }
-        if m.size == 0 {
-            m.size = size;
-        }
-        for (k, v) in &sets {
-            m.properties.insert(k.clone(), v.clone());
-        }
-        for k in &a.remove {
-            m.properties.remove(k);
-        }
-        m.save(&folder)?;
-        if !a.quiet {
-            println!("updated {} ({hash})", path.display());
+    let updated = metacmd::apply_put(&folder, &a.paths, &sets, &a.remove)?;
+    if !a.quiet {
+        for (path, hash) in updated {
+            println!("updated {path} ({hash})");
         }
     }
     Ok(())

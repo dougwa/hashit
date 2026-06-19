@@ -975,9 +975,14 @@ dependencies = [
  "hashit-extract",
  "notify",
  "notify-debouncer-full",
+ "prost",
+ "protoc-bin-vendored",
  "rayon",
  "serde",
  "serde_json",
+ "tokio",
+ "tonic",
+ "tonic-build",
 ]
 
 [[package]]
