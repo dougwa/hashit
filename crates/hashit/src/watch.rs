@@ -7,8 +7,8 @@ use anyhow::{Context, Result};
 use notify::{RecursiveMode, Watcher};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult};
 
-use crate::manifest::is_manifest_file;
-use crate::scan::{is_apple_double, process_dir, scan, ScanOptions, ScanStats};
+use hashit_core::manifest::is_manifest_file;
+use hashit_core::scan::{is_apple_double, process_dir, scan, ScanOptions, ScanStats};
 
 /// Run a full scan, then watch every `root` recursively and keep `.hashit`
 /// manifests updated as files are added, changed, or removed. Blocks until
