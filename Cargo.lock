@@ -747,9 +747,12 @@ dependencies = [
  "clap",
  "glob",
  "hashit-core",
+ "hashit-extract",
  "notify",
  "notify-debouncer-full",
  "rayon",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

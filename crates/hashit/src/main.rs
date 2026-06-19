@@ -5,18 +5,24 @@
 //! separate `hashit-idx` daemon; this tool only ever touches individual files
 //! under the roots it is given.
 
+mod meta_pass;
 mod watch;
 
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use glob::Pattern;
+use serde::Serialize;
 
 use hashit_core::fileops::{self, OpOptions};
 use hashit_core::hash::HashAlgo;
+use hashit_core::manifest::ManifestCache;
+use hashit_core::meta::{self, MetaFile};
 use hashit_core::scan::{self, ScanOptions, ScanStats};
+use meta_pass::MetaOptions;
 
 #[derive(Parser)]
 #[command(
@@ -41,6 +47,10 @@ enum Command {
     Mv(MvArgs),
     /// Remove files/directories (like rm), updating source .hashit manifests.
     Rm(RmArgs),
+    /// Show metadata for path(s): tags, properties, and thumbnail/preview paths.
+    GetMeta(GetMetaArgs),
+    /// Set or remove user-authored metadata properties for path(s).
+    PutMeta(PutMetaArgs),
 }
 
 #[derive(Args)]
@@ -78,10 +88,52 @@ struct CommonArgs {
     include_apple_double: bool,
 }
 
+/// Flags controlling per-hash metadata artifacts, shared by `scan` and `watch`.
+#[derive(Args)]
+struct MetaArgs {
+    /// Generate a 512px thumbnail for each content hash that lacks one.
+    #[arg(long)]
+    meta_thumbnail: bool,
+    /// Generate a 2048px preview for each content hash that lacks one.
+    #[arg(long)]
+    meta_preview: bool,
+    /// Extract EXIF tags into <hash>.meta.json for each hash that lacks them.
+    #[arg(long)]
+    meta_tags: bool,
+    /// Shorthand for --meta-thumbnail --meta-preview --meta-tags.
+    #[arg(long)]
+    meta_all: bool,
+    /// Folder holding sharded per-hash metadata (default $HASHIT_META or ~/.hashit-meta).
+    #[arg(long, value_name = "PATH")]
+    meta_folder: Option<PathBuf>,
+}
+
+impl MetaArgs {
+    /// Resolve the requested artifacts, or `None` when no `--meta-*` flag is set.
+    fn to_options(&self) -> Option<MetaOptions> {
+        let (thumbnail, preview, tags) = (
+            self.meta_thumbnail || self.meta_all,
+            self.meta_preview || self.meta_all,
+            self.meta_tags || self.meta_all,
+        );
+        if !(thumbnail || preview || tags) {
+            return None;
+        }
+        Some(MetaOptions {
+            folder: meta::resolve_meta_folder(self.meta_folder.clone()),
+            thumbnail,
+            preview,
+            tags,
+        })
+    }
+}
+
 #[derive(Args)]
 struct ScanArgs {
     #[command(flatten)]
     common: CommonArgs,
+    #[command(flatten)]
+    meta: MetaArgs,
     /// Report changes without writing any .hashit files.
     #[arg(long)]
     dry_run: bool,
@@ -91,9 +143,40 @@ struct ScanArgs {
 struct WatchArgs {
     #[command(flatten)]
     common: CommonArgs,
+    #[command(flatten)]
+    meta: MetaArgs,
     /// Debounce window in milliseconds for coalescing filesystem events.
     #[arg(long, default_value_t = 500)]
     debounce_ms: u64,
+}
+
+#[derive(Args)]
+struct GetMetaArgs {
+    /// File path(s) to look up (must already be recorded in a .hashit manifest).
+    #[arg(required = true, num_args = 1.., value_name = "PATH")]
+    paths: Vec<PathBuf>,
+    /// Folder holding sharded per-hash metadata (default $HASHIT_META or ~/.hashit-meta).
+    #[arg(long, value_name = "PATH")]
+    meta_folder: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct PutMetaArgs {
+    /// File path(s) to update (must already be recorded in a .hashit manifest).
+    #[arg(required = true, num_args = 1.., value_name = "PATH")]
+    paths: Vec<PathBuf>,
+    /// Set a user property, KEY=VALUE. Repeatable.
+    #[arg(long = "set", value_name = "KEY=VALUE")]
+    set: Vec<String>,
+    /// Remove a user property by KEY. Repeatable.
+    #[arg(long = "remove", value_name = "KEY")]
+    remove: Vec<String>,
+    /// Folder holding sharded per-hash metadata (default $HASHIT_META or ~/.hashit-meta).
+    #[arg(long, value_name = "PATH")]
+    meta_folder: Option<PathBuf>,
+    /// Suppress per-path output.
+    #[arg(short, long)]
+    quiet: bool,
 }
 
 #[derive(Args)]
@@ -249,12 +332,33 @@ fn run(cli: Cli) -> Result<()> {
                 let prefix = if a.dry_run { "dry-run: " } else { "" };
                 println!("{prefix}{stats}");
             }
+            // The metadata pass reads the manifests just written, so skip it on a
+            // dry run (nothing was persisted to derive artifacts from).
+            if !a.dry_run {
+                if let Some(mopts) = a.meta.to_options() {
+                    meta_pass::run(&a.common.roots, &mopts, opts.quiet)?;
+                }
+            }
             Ok(())
         }
         Command::Watch(a) => {
             set_workers(a.common.workers);
             let opts = build_options(&a.common, false)?;
-            watch::watch(&a.common.roots, &opts, a.debounce_ms, |_, _| {})
+            let mopts = a.meta.to_options();
+            // Seed metadata for the initial scan state, then keep it fresh as
+            // each changed directory is reconciled.
+            if let Some(m) = &mopts {
+                meta_pass::run(&a.common.roots, m, opts.quiet)?;
+            }
+            watch::watch(&a.common.roots, &opts, a.debounce_ms, |_, dir| {
+                if let Some(m) = &mopts {
+                    if let Err(e) = meta_pass::run_for_dir(dir, m) {
+                        if !opts.quiet {
+                            eprintln!("hashit: meta update failed for {}: {e:#}", dir.display());
+                        }
+                    }
+                }
+            })
         }
         Command::Cp(a) => {
             set_workers(a.workers);
@@ -286,7 +390,131 @@ fn run(cli: Cli) -> Result<()> {
             };
             fileops::rm(&a.paths, &opts, &scan_opts)
         }
+        Command::GetMeta(a) => get_meta(&a),
+        Command::PutMeta(a) => put_meta(&a),
     }
+}
+
+/// Resolve a file to its recorded `(hash, algo, size)` from the manifest in its
+/// parent directory. Errors if the file isn't recorded yet.
+fn entry_for(cache: &mut ManifestCache, path: &Path) -> Result<(String, String, u64)> {
+    match cache.entry_for(path) {
+        Some(e) => Ok((e.hash, e.algo, e.size)),
+        None => bail!(
+            "{}: no .hashit entry found; run `hashit scan` on its directory first",
+            path.display()
+        ),
+    }
+}
+
+/// One path's metadata in the `get-meta` JSON output. Absent fields are omitted;
+/// a lookup failure is reported via `error`.
+#[derive(Default, Serialize)]
+struct MetaView {
+    path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    algo: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ext: Option<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    tags: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    properties: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thumbnail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preview: Option<String>,
+}
+
+fn get_meta(a: &GetMetaArgs) -> Result<()> {
+    let folder = meta::resolve_meta_folder(a.meta_folder.clone());
+    let mut cache = ManifestCache::default();
+    let mut out: Vec<MetaView> = Vec::with_capacity(a.paths.len());
+    for path in &a.paths {
+        let mut view = MetaView {
+            path: path.display().to_string(),
+            ..Default::default()
+        };
+        match entry_for(&mut cache, path) {
+            Err(e) => view.error = Some(format!("{e:#}")),
+            Ok((hash, algo, size)) => {
+                if let Some(m) = MetaFile::load(&folder, &hash)? {
+                    view.file_type = m.file_type;
+                    view.ext = m.ext;
+                    view.tags = m.tags;
+                    view.properties = m.properties;
+                }
+                let thumb = meta::thumbnail_path(&folder, &hash);
+                if thumb.exists() {
+                    view.thumbnail = Some(thumb.display().to_string());
+                }
+                let preview = meta::preview_path(&folder, &hash);
+                if preview.exists() {
+                    view.preview = Some(preview.display().to_string());
+                }
+                view.hash = Some(hash);
+                view.algo = Some(algo);
+                view.size = Some(size);
+            }
+        }
+        out.push(view);
+    }
+    println!("{}", serde_json::to_string_pretty(&out)?);
+    Ok(())
+}
+
+fn put_meta(a: &PutMetaArgs) -> Result<()> {
+    if a.set.is_empty() && a.remove.is_empty() {
+        bail!("put-meta: nothing to do (pass --set KEY=VALUE and/or --remove KEY)");
+    }
+    // Parse KEY=VALUE pairs up front so a malformed one fails before any write.
+    let sets: Vec<(String, String)> = a
+        .set
+        .iter()
+        .map(|kv| match kv.split_once('=') {
+            Some((k, v)) if !k.is_empty() => Ok((k.to_string(), v.to_string())),
+            _ => bail!("invalid --set value (expected KEY=VALUE): {kv}"),
+        })
+        .collect::<Result<_>>()?;
+
+    let folder = meta::resolve_meta_folder(a.meta_folder.clone());
+    let mut cache = ManifestCache::default();
+    // Metadata is keyed by content hash, so edit each unique hash once even if
+    // several of the given paths share it.
+    let mut done: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for path in &a.paths {
+        let (hash, algo, size) = entry_for(&mut cache, path)?;
+        if !done.insert(hash.clone()) {
+            continue;
+        }
+        let mut m = MetaFile::load(&folder, &hash)?.unwrap_or_default();
+        m.hash = hash.clone();
+        if m.algo.is_empty() {
+            m.algo = algo;
+        }
+        if m.size == 0 {
+            m.size = size;
+        }
+        for (k, v) in &sets {
+            m.properties.insert(k.clone(), v.clone());
+        }
+        for k in &a.remove {
+            m.properties.remove(k);
+        }
+        m.save(&folder)?;
+        if !a.quiet {
+            println!("updated {} ({hash})", path.display());
+        }
+    }
+    Ok(())
 }
 
 fn main() -> ExitCode {

@@ -9,4 +9,6 @@
 pub mod fileops;
 pub mod hash;
 pub mod manifest;
+pub mod meta;
 pub mod scan;
+pub mod walk;
