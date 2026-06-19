@@ -1,0 +1,13 @@
+[package]
+name = "hashit-extract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Extraction engine for hashit: file-type detection, EXIF tags, thumbnails, and previews."
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+exiftool_rs.workspace = true
+magick-core.workspace = true
+magick-codecs.workspace = true

@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::Result;
 use exiftool_rs::value::Value;
 
-use crate::store::MetaTag;
+use crate::MetaTag;
 
 /// Read all metadata tags from `path` and flatten them into EAV rows.
 /// The human-readable PrintConv rendering is stored as the value; raw numeric

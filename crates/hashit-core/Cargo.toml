@@ -1,0 +1,19 @@
+[package]
+name = "hashit-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared core for hashit: .hashit manifest model, hashing, scan engine, file ops, and per-hash metadata files."
+
+[dependencies]
+anyhow.workspace = true
+blake3.workspace = true
+chrono.workspace = true
+clap.workspace = true
+glob.workspace = true
+hex.workspace = true
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+walkdir.workspace = true

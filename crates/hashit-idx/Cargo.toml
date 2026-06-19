@@ -1,0 +1,17 @@
+[package]
+name = "hashit-idx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Read-only global index and local gRPC search over .hashit manifests and .hashit-meta files."
+
+[[bin]]
+name = "hashit-idx"
+path = "src/main.rs"
+
+[dependencies]
+hashit-core.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true

@@ -1,47 +1,48 @@
-[package]
-name = "hashit"
-version = "0.1.0"
+[workspace]
+resolver = "2"
+members = [
+    "crates/hashit-core",
+    "crates/hashit-extract",
+    "crates/hashit",
+    "crates/hashit-idx",
+]
+
+[workspace.package]
+version = "0.2.0"
 edition = "2021"
-description = "Maintain per-directory .hashit manifests of file hashes and stats, with inventory and watch modes."
 license = "MIT"
 
-[[bin]]
-name = "hashit"
-path = "src/main.rs"
-
-[dependencies]
-clap = { version = "4.5", features = ["derive"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# Shared dependency versions. Member crates opt in with `workspace = true`,
+# so the version/feature set is defined once here.
+[workspace.dependencies]
+anyhow = "1"
 blake3 = "1.5"
-sha2 = "0.10"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4.5", features = ["derive"] }
+glob = "0.3"
 hex = "0.4"
-walkdir = "2.5"
 notify = "6.1"
 notify-debouncer-full = "0.3"
+prost = "0.13"
 rayon = "1.10"
-glob = "0.3"
-anyhow = "1"
-csv = "1.3"
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-console = "0.15"
-uuid = { version = "1", features = ["v4"], optional = true }
-rusqlite = { version = "0.31", features = ["bundled"], optional = true }
-exiftool_rs = { package = "exiftool-rs", git = "ssh://git@github.com/dougwa/exiftool-rs.git", rev = "06b04462b9d582ac6373ba3774614e6ce3bf75ae", optional = true }
-magick-core = { git = "ssh://git@github.com/dougwa/magick-rs.git", rev = "1f79a00557922e15952b2bf9f3ca9fae93f17a40", optional = true }
-magick-codecs = { git = "ssh://git@github.com/dougwa/magick-rs.git", rev = "1f79a00557922e15952b2bf9f3ca9fae93f17a40", optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs"], optional = true }
-tokio-util = { version = "0.7", features = ["io"], optional = true }
-axum = { version = "0.7", optional = true }
-tower-http = { version = "0.5", features = ["cors"], optional = true }
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+tonic = "0.12"
+tonic-build = "0.12"
+protoc-bin-vendored = "3"
+walkdir = "2.5"
 
-[features]
-default = ["extract"]
-# The metadata subsystem: global SQLite index, drive registry, extractors,
-# thumbnails. Gated so the core CLI can build without these heavier deps.
-extract = ["dep:uuid", "dep:rusqlite", "dep:exiftool_rs", "dep:magick-core", "dep:magick-codecs"]
-# Headless HTTP API (`hashit serve`) over the metadata index. Implies `extract`.
-serve = ["extract", "dep:tokio", "dep:tokio-util", "dep:axum", "dep:tower-http"]
+# The metadata/image crates live behind the workspace too, but only
+# hashit-extract pulls them.
+exiftool_rs = { package = "exiftool-rs", git = "ssh://git@github.com/dougwa/exiftool-rs.git", rev = "06b04462b9d582ac6373ba3774614e6ce3bf75ae" }
+magick-core = { git = "ssh://git@github.com/dougwa/magick-rs.git", rev = "1f79a00557922e15952b2bf9f3ca9fae93f17a40" }
+magick-codecs = { git = "ssh://git@github.com/dougwa/magick-rs.git", rev = "1f79a00557922e15952b2bf9f3ca9fae93f17a40" }
+
+hashit-core = { path = "crates/hashit-core" }
+hashit-extract = { path = "crates/hashit-extract" }
 
 [profile.release]
 opt-level = 3
