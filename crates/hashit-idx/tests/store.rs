@@ -14,6 +14,10 @@ use hashit_core::meta::MetaFile;
 #[allow(dead_code)] // FileRow fields are read by the binary, not every test.
 mod store;
 
+// `store` references `crate::query`, so pull the query module in too.
+#[path = "../src/query/mod.rs"]
+mod query;
+
 use store::{QueryParams, Store};
 
 fn unique_dir(tag: &str) -> PathBuf {
@@ -130,6 +134,60 @@ fn index_and_query() {
     Manifest::delete(&root).unwrap();
     s.sync_dir(&root).unwrap();
     assert_eq!(s.stats().unwrap().0, 0);
+
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&meta_folder).ok();
+    std::fs::remove_dir_all(db.parent().unwrap()).ok();
+}
+
+#[test]
+fn query_language_end_to_end() {
+    let root = unique_dir("ql-root");
+    let meta_folder = unique_dir("ql-meta");
+    let db = unique_dir("ql-db").join("index.db");
+
+    let mut files = BTreeMap::new();
+    files.insert("photo.jpg".to_string(), entry(2000, "abcd1234ef567890"));
+    files.insert("notes.txt".to_string(), entry(10, "deadbeef00112233"));
+    Manifest::new(files).save(&root).unwrap();
+
+    let mut m = MetaFile {
+        hash: "abcd1234ef567890".to_string(),
+        algo: "blake3".to_string(),
+        size: 2000,
+        file_type: Some("image".to_string()),
+        ext: Some("jpg".to_string()),
+        extractor_version: 1,
+        tags: BTreeMap::from([("EXIF:Model".to_string(), "Canon".to_string())]),
+        properties: BTreeMap::from([("rating".to_string(), "5".to_string())]),
+        updated_at: String::new(),
+    };
+    m.save(&meta_folder).unwrap();
+
+    let mut s = Store::open(&db).unwrap();
+    s.rebuild(std::slice::from_ref(&root), &meta_folder).unwrap();
+
+    // The entries' mtime (1.7e18 ns) is 2023-11-14, shared by both files.
+    let run = |q: &str| {
+        let ast = query::parse(q).unwrap();
+        let filter = query::lower(&ast, chrono::Local::now()).unwrap();
+        s.query_filter(&filter).unwrap().1
+    };
+
+    assert_eq!(run("photo"), 1); // default field set (name/path/hash)
+    assert_eq!(run("name:notes"), 1);
+    assert_eq!(run("ext:jpg"), 1);
+    assert_eq!(run("size:1000.."), 1); // open range, only the 2000-byte file
+    assert_eq!(run("-type:image"), 1); // negation → the text file (no content row)
+    assert_eq!(run("rating:5"), 1); // user-property value, substring
+    assert_eq!(run(r#""EXIF:Model":Canon"#), 1); // quoted field name with colons
+    assert_eq!(run("exif-model:Canon"), 1); // '-' alias for ':', case-insensitive key
+    assert_eq!(run("exif-model:Nikon"), 0); // right key, wrong value
+    assert_eq!(run("mtime:{2023}"), 2); // both share a 2023 mtime
+    assert_eq!(run("mtime:{2024}"), 0);
+    assert_eq!(run("mtime:..{2020}"), 0); // open low bound
+    assert_eq!(run("photo +ext:jpg"), 1); // AND of two terms
+    assert_eq!(run("photo -ext:jpg"), 0); // contradictory terms
 
     std::fs::remove_dir_all(&root).ok();
     std::fs::remove_dir_all(&meta_folder).ok();

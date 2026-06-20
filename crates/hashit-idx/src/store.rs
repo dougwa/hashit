@@ -14,6 +14,8 @@ use hashit_core::manifest::Manifest;
 use hashit_core::meta::{MetaFile, META_SUFFIX};
 use hashit_core::walk;
 
+use crate::query::lower::{Filter, NumCol, Pred, TextCol};
+
 const SCHEMA_VERSION: i64 = 1;
 
 /// Filters for a search, decoupled from the gRPC types.
@@ -321,6 +323,54 @@ impl Store {
         Ok((rows, total))
     }
 
+    /// Run a search expressed as a lowered query-language [`Filter`]; returns the
+    /// matched rows and the total match count. The richer sibling of [`Self::query`]
+    /// (per-field negation, the default field set, open ranges).
+    pub fn query_filter(&self, filter: &Filter) -> Result<(Vec<FileRow>, u64)> {
+        let mut where_sql = String::from(" WHERE 1=1");
+        let mut binds: Vec<Box<dyn ToSql>> = Vec::new();
+        for pred in &filter.preds {
+            append_pred(&mut where_sql, &mut binds, pred);
+        }
+
+        // Both queries need the content join because predicates may touch c.ext /
+        // c.file_type.
+        let from_sql = "FROM files f LEFT JOIN content c ON c.algo=f.algo AND c.hash=f.hash";
+
+        let total: u64 = {
+            let sql = format!("SELECT COUNT(*) {from_sql}{where_sql}");
+            self.conn.query_row(&sql, params_from_iter(binds.iter()), |r| {
+                Ok(r.get::<_, i64>(0)? as u64)
+            })?
+        };
+
+        let limit = if filter.limit == 0 { 100 } else { filter.limit };
+        let sql = format!(
+            "SELECT f.path, f.name, f.hash, f.algo, f.size, f.mtime_ns, c.file_type, c.ext
+             {from_sql}{where_sql}
+             ORDER BY f.path LIMIT ? OFFSET ?"
+        );
+        binds.push(Box::new(limit as i64));
+        binds.push(Box::new(filter.offset as i64));
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params_from_iter(binds.iter()), |r| {
+                Ok(FileRow {
+                    path: r.get(0)?,
+                    name: r.get(1)?,
+                    hash: r.get(2)?,
+                    algo: r.get(3)?,
+                    size: r.get::<_, i64>(4)? as u64,
+                    mtime_ns: r.get::<_, i64>(5)? as u64,
+                    file_type: r.get(6)?,
+                    ext: r.get(7)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((rows, total))
+    }
+
     /// (files, distinct hashes, meta_kv rows).
     pub fn stats(&self) -> Result<(u64, u64, u64)> {
         let files: i64 = self.conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?;
@@ -329,6 +379,110 @@ impl Store {
                 .query_row("SELECT COUNT(DISTINCT hash) FROM files", [], |r| r.get(0))?;
         let tags: i64 = self.conn.query_row("SELECT COUNT(*) FROM meta_kv", [], |r| r.get(0))?;
         Ok((files as u64, hashes as u64, tags as u64))
+    }
+}
+
+/// Lower one [`Pred`] into a `WHERE` fragment (with leading ` AND `) plus its
+/// bound parameters. Negation wraps the condition in `NOT (...)`.
+fn append_pred(where_sql: &mut String, binds: &mut Vec<Box<dyn ToSql>>, pred: &Pred) {
+    match pred {
+        Pred::Text {
+            col,
+            needle,
+            negate,
+        } => {
+            let cond = match col {
+                // Hash matches as a prefix; the rest are case-insensitive substrings.
+                TextCol::Hash => "f.hash LIKE ? || '%'".to_string(),
+                _ => format!("instr(lower({}), lower(?))>0", text_column(col)),
+            };
+            append_cond(where_sql, &cond, *negate);
+            binds.push(Box::new(needle.clone()));
+        }
+        Pred::AnyText { needle, negate } => {
+            // The default field set: name, path, hash.
+            let cond = "(instr(lower(f.name), lower(?))>0 \
+                         OR instr(lower(f.path), lower(?))>0 \
+                         OR f.hash LIKE ? || '%')";
+            append_cond(where_sql, cond, *negate);
+            binds.push(Box::new(needle.clone()));
+            binds.push(Box::new(needle.clone()));
+            binds.push(Box::new(needle.clone()));
+        }
+        Pred::Range {
+            col,
+            lo,
+            hi,
+            negate,
+        } => {
+            let column = match col {
+                NumCol::Size => "f.size",
+                NumCol::Mtime => "f.mtime_ns",
+            };
+            let mut parts: Vec<String> = Vec::new();
+            if lo.is_some() {
+                parts.push(format!("{column} >= ?"));
+            }
+            if hi.is_some() {
+                parts.push(format!("{column} < ?"));
+            }
+            if parts.is_empty() {
+                return; // a fully-open range constrains nothing
+            }
+            let cond = if parts.len() == 2 {
+                format!("({})", parts.join(" AND "))
+            } else {
+                parts.remove(0)
+            };
+            append_cond(where_sql, &cond, *negate);
+            if let Some(v) = lo {
+                binds.push(Box::new(*v));
+            }
+            if let Some(v) = hi {
+                binds.push(Box::new(*v));
+            }
+        }
+        Pred::Meta {
+            key,
+            value,
+            negate,
+        } => {
+            let cond = match value {
+                Some(_) => "EXISTS (SELECT 1 FROM meta_kv m WHERE m.algo=f.algo AND m.hash=f.hash \
+                            AND lower(m.key)=lower(?) AND instr(lower(m.value), lower(?))>0)",
+                None => "EXISTS (SELECT 1 FROM meta_kv m WHERE m.algo=f.algo AND m.hash=f.hash \
+                         AND lower(m.key)=lower(?))",
+            };
+            append_cond(where_sql, cond, *negate);
+            binds.push(Box::new(key.clone()));
+            if let Some(v) = value {
+                binds.push(Box::new(v.clone()));
+            }
+        }
+    }
+}
+
+fn text_column(col: &TextCol) -> &'static str {
+    match col {
+        TextCol::Name => "f.name",
+        TextCol::Path => "f.path",
+        TextCol::Hash => "f.hash",
+        TextCol::Algo => "f.algo",
+        // COALESCE so a NULL (no content row) reads as empty rather than
+        // poisoning a negated match.
+        TextCol::Ext => "COALESCE(c.ext,'')",
+        TextCol::FileType => "COALESCE(c.file_type,'')",
+    }
+}
+
+fn append_cond(where_sql: &mut String, cond: &str, negate: bool) {
+    where_sql.push_str(" AND ");
+    if negate {
+        where_sql.push_str("NOT (");
+        where_sql.push_str(cond);
+        where_sql.push(')');
+    } else {
+        where_sql.push_str(cond);
     }
 }
 

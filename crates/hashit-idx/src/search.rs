@@ -24,28 +24,43 @@ impl Search for SearchService {
         request: Request<QueryRequest>,
     ) -> Result<Response<QueryResponse>, Status> {
         let r = request.into_inner();
-        let params = QueryParams {
-            name: r.name,
-            hash: r.hash,
-            min_size: nonzero(r.min_size),
-            max_size: nonzero(r.max_size),
-            min_mtime_ns: parse_rfc3339_ns(&r.min_date),
-            max_mtime_ns: parse_rfc3339_ns(&r.max_date),
-            tags: r
-                .tags
-                .into_iter()
-                .map(|t| {
-                    let value = if t.value.is_empty() { None } else { Some(t.value) };
-                    (t.key, value)
-                })
-                .collect(),
-            limit: r.limit,
-            offset: r.offset,
-        };
 
-        // The query is synchronous and fast; run it while briefly holding the
-        // lock, never across an await.
-        let (rows, total) = {
+        // A non-empty `query` string uses the query language; otherwise fall back
+        // to the structured fields. Either path is synchronous and fast, so we run
+        // it while briefly holding the lock, never across an await.
+        let (rows, total) = if !r.query.trim().is_empty() {
+            let ast = crate::query::parse(&r.query)
+                .map_err(|e| Status::invalid_argument(format!("parse: {e:#}")))?;
+            let mut filter = crate::query::lower(&ast, chrono::Local::now())
+                .map_err(|e| Status::invalid_argument(format!("query: {e:#}")))?;
+            filter.limit = r.limit;
+            filter.offset = r.offset;
+            let store = self
+                .store
+                .lock()
+                .map_err(|_| Status::internal("index lock poisoned"))?;
+            store
+                .query_filter(&filter)
+                .map_err(|e| Status::internal(format!("{e:#}")))?
+        } else {
+            let params = QueryParams {
+                name: r.name,
+                hash: r.hash,
+                min_size: nonzero(r.min_size),
+                max_size: nonzero(r.max_size),
+                min_mtime_ns: parse_rfc3339_ns(&r.min_date),
+                max_mtime_ns: parse_rfc3339_ns(&r.max_date),
+                tags: r
+                    .tags
+                    .into_iter()
+                    .map(|t| {
+                        let value = if t.value.is_empty() { None } else { Some(t.value) };
+                        (t.key, value)
+                    })
+                    .collect(),
+                limit: r.limit,
+                offset: r.offset,
+            };
             let store = self
                 .store
                 .lock()

@@ -34,6 +34,9 @@ message QueryRequest {
   // Pagination. limit 0 means "server default".
   uint32 limit = 8;
   uint32 offset = 9;
+  // Query-language string (see QUERY.md). When non-empty it supersedes the
+  // structured fields above; limit/offset still apply.
+  string query = 10;
 }
 
 message FileResult {

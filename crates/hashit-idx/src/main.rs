@@ -6,6 +6,7 @@
 //! localhost-only gRPC endpoint. It never writes the source files — all updates
 //! flow through `hashit`.
 
+mod query;
 mod search;
 mod store;
 mod watcher;
