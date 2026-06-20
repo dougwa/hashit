@@ -193,3 +193,57 @@ fn query_language_end_to_end() {
     std::fs::remove_dir_all(&meta_folder).ok();
     std::fs::remove_dir_all(db.parent().unwrap()).ok();
 }
+
+#[test]
+fn dir_and_operator_queries() {
+    let root = unique_dir("op-root");
+    let meta_folder = unique_dir("op-meta");
+    let db = unique_dir("op-db").join("index.db");
+
+    // One file directly in `root`, one in a `root/sub` subdirectory; each
+    // directory gets its own `.hashit` manifest.
+    let mut top = BTreeMap::new();
+    top.insert("notes.txt".to_string(), entry(10, "deadbeef00112233"));
+    Manifest::new(top).save(&root).unwrap();
+
+    let sub = root.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    let mut nested = BTreeMap::new();
+    nested.insert("photo.jpg".to_string(), entry(2000, "abcd1234ef567890"));
+    Manifest::new(nested).save(&sub).unwrap();
+
+    let mut s = Store::open(&db).unwrap();
+    s.rebuild(std::slice::from_ref(&root), &meta_folder).unwrap();
+
+    let run = |q: &str| {
+        let ast = query::parse(q).unwrap();
+        let filter = query::lower(&ast, chrono::Local::now()).unwrap();
+        s.query_filter(&filter).unwrap().1
+    };
+
+    let root_s = root.to_string_lossy();
+    let sub_s = sub.to_string_lossy();
+
+    // `=` exact: only files directly in that directory.
+    assert_eq!(run(&format!("dir={root_s}")), 1); // just notes.txt
+    assert_eq!(run(&format!("dir={sub_s}")), 1); // just photo.jpg
+
+    // `:=` LIKE glob: the whole subtree under root (both files).
+    assert_eq!(run(&format!("dir:={root_s}/%")), 1); // descendants only → photo.jpg
+    assert_eq!(run(&format!("dir:={root_s}%")), 2); // root and below → both
+
+    // `:` substring still works on dir.
+    assert_eq!(run("dir:sub"), 1);
+
+    // Exact vs substring on a text field.
+    assert_eq!(run("name=notes.txt"), 1);
+    assert_eq!(run("name=notes"), 0); // exact: no partial credit
+    assert_eq!(run("name:notes"), 1); // substring
+
+    // `=`/`:=` are text-only for now.
+    assert!(query::lower(&query::parse("size=10").unwrap(), chrono::Local::now()).is_err());
+
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&meta_folder).ok();
+    std::fs::remove_dir_all(db.parent().unwrap()).ok();
+}

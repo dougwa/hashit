@@ -7,7 +7,7 @@
 use anyhow::{bail, Result};
 use chrono::{DateTime, Local};
 
-use super::ast::{Field, Matcher, Presence, Query, Value};
+use super::ast::{Field, Matcher, Op, Presence, Query, Value};
 
 /// A flat AND of column predicates.
 pub struct Filter {
@@ -17,10 +17,11 @@ pub struct Filter {
 }
 
 pub enum Pred {
-    /// Substring match on a text column (`LIKE %needle%`, negated → `NOT LIKE`).
+    /// A match on a text column; [`TextMode`] picks how `needle` is compared.
     Text {
         col: TextCol,
         needle: String,
+        mode: TextMode,
         negate: bool,
     },
     /// Substring match across the default field set (OR of the default columns).
@@ -33,9 +34,11 @@ pub enum Pred {
         negate: bool,
     },
     /// A tag/property key, optionally constrained to a value (`EXISTS` in `meta_kv`).
+    /// When `value` is set, [`TextMode`] picks how it is compared.
     Meta {
         key: String,
         value: Option<String>,
+        mode: TextMode,
         negate: bool,
     },
 }
@@ -43,10 +46,25 @@ pub enum Pred {
 pub enum TextCol {
     Name,
     Path,
+    Dir,
     Hash,
     Algo,
     Ext,
     FileType,
+}
+
+/// How a text needle is compared against its column. Chosen by the field + the
+/// query operator; see [`text_mode`].
+#[derive(Clone, Copy)]
+pub enum TextMode {
+    /// `:` on most fields — case-insensitive substring.
+    Substring,
+    /// `:` on `hash` — a prefix match.
+    Prefix,
+    /// `=` — case-insensitive equality.
+    Exact,
+    /// `:=` — SQL `LIKE` with caller-supplied wildcards.
+    Like,
 }
 
 pub enum NumCol {
@@ -58,6 +76,10 @@ pub fn lower(q: &Query, now: DateTime<Local>) -> Result<Filter> {
     let mut preds = Vec::with_capacity(q.terms.len());
     for t in &q.terms {
         let negate = matches!(t.presence, Presence::MustNot);
+        // Only `:` is meaningful on ordered fields; `=`/`:=` are text-only for now.
+        if matches!(t.field, Field::Size | Field::Mtime) && !matches!(t.op, Op::Match) {
+            bail!("operator {:?} is not supported for field {:?}", t.op, t.field);
+        }
         let pred = match (&t.field, &t.matcher) {
             // Ordered fields: ranges and single values both become `Range`.
             (Field::Mtime, m) => {
@@ -78,16 +100,17 @@ pub fn lower(q: &Query, now: DateTime<Local>) -> Result<Filter> {
                     negate,
                 }
             }
-            // Text columns.
-            (Field::Name, Matcher::Single(Value::Text(s))) => text(TextCol::Name, s, negate),
-            (Field::Path, Matcher::Single(Value::Text(s))) => text(TextCol::Path, s, negate),
-            (Field::Hash, Matcher::Single(Value::Text(s))) => text(TextCol::Hash, s, negate),
-            (Field::Algo, Matcher::Single(Value::Text(s))) => text(TextCol::Algo, s, negate),
-            (Field::Ext, Matcher::Single(Value::Text(s))) => text(TextCol::Ext, s, negate),
+            // Text columns. The operator picks the match mode.
+            (Field::Name, Matcher::Single(Value::Text(s))) => text(TextCol::Name, s, t, negate),
+            (Field::Path, Matcher::Single(Value::Text(s))) => text(TextCol::Path, s, t, negate),
+            (Field::Dir, Matcher::Single(Value::Text(s))) => text(TextCol::Dir, s, t, negate),
+            (Field::Hash, Matcher::Single(Value::Text(s))) => text(TextCol::Hash, s, t, negate),
+            (Field::Algo, Matcher::Single(Value::Text(s))) => text(TextCol::Algo, s, t, negate),
+            (Field::Ext, Matcher::Single(Value::Text(s))) => text(TextCol::Ext, s, t, negate),
             (Field::FileType, Matcher::Single(Value::Text(s))) => {
-                text(TextCol::FileType, s, negate)
+                text(TextCol::FileType, s, t, negate)
             }
-            // The default field set.
+            // The default field set (always the `:` operator — no field, no operator token).
             (Field::Default, Matcher::Single(Value::Text(s))) => Pred::AnyText {
                 needle: s.clone(),
                 negate,
@@ -96,6 +119,7 @@ pub fn lower(q: &Query, now: DateTime<Local>) -> Result<Filter> {
             (Field::Meta(k), Matcher::Single(v)) => Pred::Meta {
                 key: k.clone(),
                 value: Some(v.as_text()),
+                mode: text_mode(&Field::Meta(k.clone()), t.op),
                 negate,
             },
             // Ranges are only meaningful on ordered fields.
@@ -111,11 +135,25 @@ pub fn lower(q: &Query, now: DateTime<Local>) -> Result<Filter> {
     })
 }
 
-fn text(col: TextCol, needle: &str, negate: bool) -> Pred {
+fn text(col: TextCol, needle: &str, term: &super::ast::Term, negate: bool) -> Pred {
     Pred::Text {
         col,
         needle: needle.to_string(),
+        mode: text_mode(&term.field, term.op),
         negate,
+    }
+}
+
+/// The comparison a `(field, op)` pair lowers to. `=` is exact and `:=` is a raw
+/// `LIKE` everywhere; `:` is a substring except on `hash`, which is a prefix.
+fn text_mode(field: &Field, op: Op) -> TextMode {
+    match op {
+        Op::Exact => TextMode::Exact,
+        Op::Like => TextMode::Like,
+        Op::Match => match field {
+            Field::Hash => TextMode::Prefix,
+            _ => TextMode::Substring,
+        },
     }
 }
 

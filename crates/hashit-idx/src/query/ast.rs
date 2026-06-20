@@ -16,6 +16,7 @@ pub struct Query {
 pub struct Term {
     pub presence: Presence,
     pub field: Field,
+    pub op: Op,
     pub matcher: Matcher,
 }
 
@@ -27,6 +28,18 @@ pub enum Presence {
     MustNot,
 }
 
+/// The match operator between a field and its value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Op {
+    /// `:` — partial match (substring; `hash:` is a prefix match).
+    #[default]
+    Match,
+    /// `=` — exact equality.
+    Exact,
+    /// `:=` — SQL `LIKE` glob; the caller supplies the `%`/`_` wildcards.
+    Like,
+}
+
 /// Which field a term targets. Resolution is lenient: a name that isn't a known
 /// column becomes [`Field::Meta`] (an extracted tag or a user property key).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,6 +48,8 @@ pub enum Field {
     Default,
     Name,
     Path,
+    /// The directory containing the file (`files.dir`): the path minus the basename.
+    Dir,
     Hash,
     Algo,
     Size,

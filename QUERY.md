@@ -8,10 +8,13 @@ single value or a range.
 
 ```ebnf
 QueryString  = Term (" " Term)*
-Term         = Prefix? (Field ":")? Value
+Term         = Prefix? (Field Op)? Value
 Prefix       = "+"        ; must match   (default)
              | "-"        ; must NOT match
 Field        = word       ; property to search; omitted = the default field set
+Op           = ":"        ; partial match (default)
+             | "="        ; exact match
+             | ":="       ; SQL LIKE glob (you supply the wildcards)
 Value        = SingleValue | RangeValue
 RangeValue   = SingleValue ".." SingleValue
              | SingleValue ".."              ; open upper bound  (≥ lower)
@@ -46,6 +49,7 @@ Quote the name when you need a literal `-` in a key (`"my-prop":x`).
 |-------|----------------|-----------|-------|
 | `name` | `files.name` | text | basename; substring match |
 | `path` | `files.path` | text | full path; substring match |
+| `dir` | `files.dir` | text | containing directory (path minus the basename) |
 | `hash` | `files.hash` | text | exact or prefix |
 | `algo` | `files.algo` | text | e.g. `blake3`, `sha256` |
 | `size` | `files.size` | number | bytes; supports ranges and size suffixes (`k`, `m`, `g`) |
@@ -54,9 +58,39 @@ Quote the name when you need a literal `-` in a key (`"my-prop":x`).
 | `file_type` | `content.file_type` | text | detected type |
 | *anything else* | `meta_kv` | text | matches an extracted tag or user property key |
 
-Text matching is substring/case-insensitive by default; `hash` matches as an
-exact value or a prefix. (These per-field match modes are deliberately a small,
-swappable table so new fields slot in without touching the grammar.)
+## Operators
+
+The operator between a field and its value chooses how text is matched. All
+text matching is case-insensitive.
+
+| Operator | Meaning | Example |
+|----------|---------|---------|
+| `:` | partial match — substring (the default; `hash:` is a *prefix*) | `name:report` |
+| `=` | exact — the whole value must be equal | `dir=/photos/2024` |
+| `:=` | SQL `LIKE` glob — **you** supply the wildcards (`%` = any run, `_` = any char) | `dir:=/photos/%` |
+
+An operator only applies when a `Field` precedes it, so a bare value containing
+`=` or `:` is searched literally only when quoted (`"a=b"`); unquoted, the part
+before the operator is read as a field name (`a=b` → field `a`, exact `b`), the
+same way `:` has always behaved.
+
+`=` and `:=` apply to every text field and to metadata values. They are not yet
+supported on the ordered fields (`size`, `mtime`), which use ranges instead.
+
+### Directories
+
+`dir` is the file's containing directory. With the operators it covers both
+folder use cases:
+
+```text
+dir=/photos/2024        files directly in /photos/2024 (not its subfolders)
+dir:=/photos/2024/%     everything recursively under /photos/2024
+dir:2024                any directory whose path contains "2024"
+```
+
+`hash` matches as an exact value or a prefix. (These per-field match modes are
+deliberately a small, swappable table so new fields slot in without touching the
+grammar.)
 
 ## Values and ranges
 
@@ -190,7 +224,7 @@ camera:'Canon' mtime:{2023-06}..{2023-08}  Canon shots from summer 2023
 
 Lives in `crates/hashit-idx/src/query/`:
 
-- **`ast.rs`** — the parsed `Query` / `Term` / `Field` / `Matcher` / `Value`.
+- **`ast.rs`** — the parsed `Query` / `Term` / `Field` / `Op` / `Matcher` / `Value`.
 - **`date.rs`** — `DateExpr` resolves against a captured `now` into an
   `Interval { start, end }` of nanoseconds since the Unix epoch (the unit of
   `files.mtime_ns`); `end` is `None` for an open upper bound. The bare-term vs.
@@ -198,7 +232,9 @@ Lives in `crates/hashit-idx/src/query/`:
 - **`parse.rs`** — a hand-written scanner (`parse`) and the `{…}` date parser
   (`parse_date`); `resolve_field` is the extensible field table.
 - **`lower.rs`** — `lower(Query, now) -> Filter`, a flat AND of independently
-  negatable `Pred`s (`Text`, `AnyText`, `Range`, `Meta`).
+  negatable `Pred`s (`Text`, `AnyText`, `Range`, `Meta`). `Op` lowers to a
+  `TextMode` (`Substring`/`Prefix`/`Exact`/`Like`) on the text and metadata-value
+  predicates.
 
 The Search service parses the string **server-side**: `QueryRequest` carries a
 `string query` field (number 10) that, when non-empty, supersedes the structured

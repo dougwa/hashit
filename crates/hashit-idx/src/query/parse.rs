@@ -8,7 +8,7 @@
 use anyhow::{bail, Context, Result};
 use chrono::FixedOffset;
 
-use super::ast::{Field, Matcher, Presence, Query, Term, Value};
+use super::ast::{Field, Matcher, Op, Presence, Query, Term, Value};
 use super::date::{CalUnit, DateExpr, Keyword, PartialDate, Unit};
 
 /// Parse a query string into its AST.
@@ -40,17 +40,21 @@ fn parse_term(s: &mut Scanner) -> Result<Term> {
         _ => Presence::Must,
     };
 
-    // An optional `field:` — a bare identifier or a quoted string, immediately
-    // followed by `:`. If there's no `:`, rewind: it belongs to the value.
+    // An optional `field` + operator — a bare identifier or a quoted string,
+    // immediately followed by an operator (`:=`, `=`, or `:`; longest match first
+    // so `:=` wins over `:`). With no operator, rewind: it all belongs to the value.
     let save = s.pos();
-    let field = match parse_field_name(s)? {
-        Some(f) if s.peek() == Some(':') => {
-            s.bump();
-            f
-        }
-        _ => {
+    let (field, op) = match parse_field_name(s)? {
+        Some(f) => match parse_op(s) {
+            Some(op) => (f, op),
+            None => {
+                s.set_pos(save);
+                (Field::Default, Op::Match)
+            }
+        },
+        None => {
             s.set_pos(save);
-            Field::Default
+            (Field::Default, Op::Match)
         }
     };
 
@@ -58,8 +62,25 @@ fn parse_term(s: &mut Scanner) -> Result<Term> {
     Ok(Term {
         presence,
         field,
+        op,
         matcher,
     })
+}
+
+/// Consume a match operator if one is next: `:=` → [`Op::Like`], `=` →
+/// [`Op::Exact`], `:` → [`Op::Match`]. `:=` is checked first (longest match).
+fn parse_op(s: &mut Scanner) -> Option<Op> {
+    if s.eat_str(":=") {
+        Some(Op::Like)
+    } else if s.peek() == Some('=') {
+        s.bump();
+        Some(Op::Exact)
+    } else if s.peek() == Some(':') {
+        s.bump();
+        Some(Op::Match)
+    } else {
+        None
+    }
 }
 
 fn parse_matcher(s: &mut Scanner, field: &Field) -> Result<Matcher> {
@@ -121,6 +142,7 @@ pub fn resolve_field(word: &str) -> Field {
     match word {
         "name" => Field::Name,
         "path" => Field::Path,
+        "dir" => Field::Dir,
         "hash" => Field::Hash,
         "algo" => Field::Algo,
         "size" => Field::Size,
@@ -454,7 +476,46 @@ mod tests {
     fn dashed_value_without_colon_stays_a_default_term() {
         let t = one("foo-bar");
         assert_eq!(t.field, Field::Default);
+        assert_eq!(t.op, Op::Match);
         assert_eq!(t.matcher, Matcher::Single(Value::Text("foo-bar".into())));
+    }
+
+    #[test]
+    fn colon_is_the_default_match_operator() {
+        let t = one("name:report");
+        assert_eq!(t.field, Field::Name);
+        assert_eq!(t.op, Op::Match);
+        assert_eq!(t.matcher, Matcher::Single(Value::Text("report".into())));
+    }
+
+    #[test]
+    fn equals_is_the_exact_operator_and_dir_resolves() {
+        let t = one("dir=/a/b/c");
+        assert_eq!(t.field, Field::Dir);
+        assert_eq!(t.op, Op::Exact);
+        assert_eq!(t.matcher, Matcher::Single(Value::Text("/a/b/c".into())));
+    }
+
+    #[test]
+    fn colon_equals_is_the_like_operator_and_beats_colon() {
+        let t = one("dir:=/a/b/%");
+        assert_eq!(t.field, Field::Dir);
+        assert_eq!(t.op, Op::Like);
+        assert_eq!(t.matcher, Matcher::Single(Value::Text("/a/b/%".into())));
+    }
+
+    #[test]
+    fn equals_after_a_name_is_an_operator_like_colon() {
+        // `a=b` mirrors `a:b`: `a` is a (meta) field, `=` the exact operator.
+        // A literal `=` in a default-field search must be quoted ("a=b").
+        let t = one("a=b");
+        assert_eq!(t.field, Field::Meta("a".into()));
+        assert_eq!(t.op, Op::Exact);
+        assert_eq!(t.matcher, Matcher::Single(Value::Text("b".into())));
+
+        let quoted = one(r#""a=b""#);
+        assert_eq!(quoted.field, Field::Default);
+        assert_eq!(quoted.matcher, Matcher::Single(Value::Text("a=b".into())));
     }
 
     #[test]

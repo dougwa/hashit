@@ -16,7 +16,7 @@ pub mod date;
 pub mod lower;
 pub mod parse;
 
-pub use ast::Query;
+pub use ast::{Op, Query};
 pub use date::{DateExpr, Interval};
-pub use lower::{lower, Filter, NumCol, Pred, TextCol};
+pub use lower::{lower, Filter, NumCol, Pred, TextCol, TextMode};
 pub use parse::parse;

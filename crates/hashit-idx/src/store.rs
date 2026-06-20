@@ -14,7 +14,7 @@ use hashit_core::manifest::Manifest;
 use hashit_core::meta::{MetaFile, META_SUFFIX};
 use hashit_core::walk;
 
-use crate::query::lower::{Filter, NumCol, Pred, TextCol};
+use crate::query::lower::{Filter, NumCol, Pred, TextCol, TextMode};
 
 const SCHEMA_VERSION: i64 = 1;
 
@@ -389,13 +389,10 @@ fn append_pred(where_sql: &mut String, binds: &mut Vec<Box<dyn ToSql>>, pred: &P
         Pred::Text {
             col,
             needle,
+            mode,
             negate,
         } => {
-            let cond = match col {
-                // Hash matches as a prefix; the rest are case-insensitive substrings.
-                TextCol::Hash => "f.hash LIKE ? || '%'".to_string(),
-                _ => format!("instr(lower({}), lower(?))>0", text_column(col)),
-            };
+            let cond = text_cond(text_column(col), *mode);
             append_cond(where_sql, &cond, *negate);
             binds.push(Box::new(needle.clone()));
         }
@@ -445,15 +442,20 @@ fn append_pred(where_sql: &mut String, binds: &mut Vec<Box<dyn ToSql>>, pred: &P
         Pred::Meta {
             key,
             value,
+            mode,
             negate,
         } => {
             let cond = match value {
-                Some(_) => "EXISTS (SELECT 1 FROM meta_kv m WHERE m.algo=f.algo AND m.hash=f.hash \
-                            AND lower(m.key)=lower(?) AND instr(lower(m.value), lower(?))>0)",
+                Some(_) => format!(
+                    "EXISTS (SELECT 1 FROM meta_kv m WHERE m.algo=f.algo AND m.hash=f.hash \
+                     AND lower(m.key)=lower(?) AND {})",
+                    text_cond("m.value", *mode)
+                ),
                 None => "EXISTS (SELECT 1 FROM meta_kv m WHERE m.algo=f.algo AND m.hash=f.hash \
-                         AND lower(m.key)=lower(?))",
+                         AND lower(m.key)=lower(?))"
+                    .to_string(),
             };
-            append_cond(where_sql, cond, *negate);
+            append_cond(where_sql, &cond, *negate);
             binds.push(Box::new(key.clone()));
             if let Some(v) = value {
                 binds.push(Box::new(v.clone()));
@@ -462,10 +464,22 @@ fn append_pred(where_sql: &mut String, binds: &mut Vec<Box<dyn ToSql>>, pred: &P
     }
 }
 
+/// The SQL test for one text needle against `column`, per the match mode. The
+/// needle is the single bind placeholder; the caller pushes it once.
+fn text_cond(column: &str, mode: TextMode) -> String {
+    match mode {
+        TextMode::Substring => format!("instr(lower({column}), lower(?))>0"),
+        TextMode::Prefix => format!("{column} LIKE ? || '%'"),
+        TextMode::Exact => format!("lower({column}) = lower(?)"),
+        TextMode::Like => format!("{column} LIKE ?"),
+    }
+}
+
 fn text_column(col: &TextCol) -> &'static str {
     match col {
         TextCol::Name => "f.name",
         TextCol::Path => "f.path",
+        TextCol::Dir => "f.dir",
         TextCol::Hash => "f.hash",
         TextCol::Algo => "f.algo",
         // COALESCE so a NULL (no content row) reads as empty rather than
