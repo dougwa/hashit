@@ -20,9 +20,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tonic::transport::Server;
 
+use hashit_core::manifest::ns_to_rfc3339;
 use hashit_core::meta::resolve_meta_folder;
 
 use crate::pb::search_server::SearchServer;
@@ -36,6 +37,20 @@ use crate::store::Store;
     about = "Read-only global index + local gRPC search over .hashit and .hashit-meta files."
 )]
 struct Args {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Index the roots, watch them for changes, and serve gRPC search.
+    Serve(ServeArgs),
+    /// Run a query-language search against the existing index and print matches.
+    Query(QueryArgs),
+}
+
+#[derive(clap::Args)]
+struct ServeArgs {
     /// Roots to index and watch for .hashit changes.
     #[arg(required = true, num_args = 1.., value_name = "ROOT")]
     roots: Vec<PathBuf>,
@@ -53,6 +68,26 @@ struct Args {
     debounce_ms: u64,
 }
 
+#[derive(clap::Args)]
+struct QueryArgs {
+    /// The query string (see QUERY.md). Empty matches everything.
+    // allow_hyphen_values so a leading `-` (must-not) term isn't read as a flag.
+    #[arg(value_name = "QUERY", default_value = "", allow_hyphen_values = true)]
+    query: String,
+    /// SQLite index database path (default $HASHIT_HOME/index.db or ~/.hashit/index.db).
+    #[arg(long, value_name = "PATH")]
+    db: Option<PathBuf>,
+    /// Maximum rows to print (0 = server default of 100).
+    #[arg(long, default_value_t = 0)]
+    limit: u32,
+    /// Rows to skip, for pagination.
+    #[arg(long, default_value_t = 0)]
+    offset: u32,
+    /// Print only the matching paths, one per line.
+    #[arg(long)]
+    paths_only: bool,
+}
+
 /// Default index database location: `$HASHIT_HOME/index.db`, else
 /// `~/.hashit/index.db`, else `./.hashit-index.db`.
 fn default_db() -> PathBuf {
@@ -67,7 +102,13 @@ fn default_db() -> PathBuf {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    match Args::parse().command {
+        Command::Serve(args) => serve(args).await,
+        Command::Query(args) => run_query(args),
+    }
+}
+
+async fn serve(args: ServeArgs) -> Result<()> {
     let meta_folder = resolve_meta_folder(args.meta_folder.clone());
     let db = args.db.clone().unwrap_or_else(default_db);
 
@@ -99,5 +140,35 @@ async fn main() -> Result<()> {
         .serve(args.addr)
         .await
         .context("serving gRPC")?;
+    Ok(())
+}
+
+/// Read the existing index and run a query-language search. Reads what's there;
+/// keeping the index fresh is the running `serve` daemon's job.
+fn run_query(args: QueryArgs) -> Result<()> {
+    let db = args.db.unwrap_or_else(default_db);
+    let store = Store::open(&db).with_context(|| format!("opening index {}", db.display()))?;
+
+    let ast = query::parse(&args.query).context("parsing query")?;
+    let mut filter = query::lower(&ast, chrono::Local::now()).context("building query")?;
+    filter.limit = args.limit;
+    filter.offset = args.offset;
+
+    let (rows, total) = store.query_filter(&filter)?;
+    for r in &rows {
+        if args.paths_only {
+            println!("{}", r.path);
+        } else {
+            let kind = r.file_type.as_deref().unwrap_or("-");
+            println!(
+                "{}  {:>12}  {:<7}  {}",
+                ns_to_rfc3339(r.mtime_ns),
+                r.size,
+                kind,
+                r.path
+            );
+        }
+    }
+    eprintln!("{total} match(es); showing {}", rows.len());
     Ok(())
 }

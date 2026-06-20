@@ -137,9 +137,11 @@ content hash**, so an edit applies to every copy of that content.
 
 ## `hashit-idx` — global index + search
 
+### serve — index, watch, and serve
+
 ```sh
-hashit-idx <root>... [--meta-folder PATH] [--db PATH] [--addr 127.0.0.1:50551]
-                     [--debounce-ms 500]
+hashit-idx serve <root>... [--meta-folder PATH] [--db PATH]
+                           [--addr 127.0.0.1:50551] [--debounce-ms 500]
 ```
 
 Builds a SQLite index (default `$HASHIT_HOME/index.db` or `~/.hashit/index.db`)
@@ -150,8 +152,8 @@ fully rebuildable from disk and is never written to by anything but `hashit-idx`
 It serves a read-only **Search** gRPC service on localhost
 (`proto/search.proto`):
 
-- `Query` — filter by name (substring), hash (prefix), size range, modified-time
-  range, and tag/property key(+value); paginated.
+- `Query` — by structured fields, or by a query-language `query` string (see
+  [`QUERY.md`](QUERY.md)); paginated.
 - `Stats` — index-wide counts (files, hashes, tag/property rows).
 
 Because the service is gRPC, point any gRPC client at it. Example with
@@ -160,8 +162,25 @@ Because the service is gRPC, point any gRPC client at it. Example with
 
 ```sh
 grpcurl -plaintext -import-path proto -proto search.proto \
-  -d '{"name":"sunset","min_size":100000}' \
+  -d '{"query":"sunset size:100k.."}' \
   127.0.0.1:50551 hashit.search.v1.Search/Query
+```
+
+### query — search the index from the CLI
+
+```sh
+hashit-idx query "<query>" [--db PATH] [--limit N] [--offset N] [--paths-only]
+```
+
+Runs a [query-language](QUERY.md) search directly against the existing index
+(no running daemon required) and prints one line per match — modified time,
+size, type, and path — or just paths with `--paths-only`. An empty query
+matches everything. Examples:
+
+```sh
+hashit-idx query 'photos +ext:jpg mtime:{last month}'
+hashit-idx query 'size:100m.. mtime:{-7d}..' --paths-only
+hashit-idx query '"EXIF:Model":Canon' --limit 20
 ```
 
 ## gRPC services
