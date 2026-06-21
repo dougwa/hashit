@@ -33,18 +33,51 @@ fn to_slash(p: &Path) -> String {
     parts.join("/")
 }
 
+/// True if `path`, taken relative to `root`, contains any of the `ignore`
+/// substrings. Mirrors `hashit`'s `--ignore` matching (plain substrings, not
+/// globs); an empty list never matches.
+pub fn is_ignored(path: &Path, root: &Path, ignores: &[String]) -> bool {
+    if ignores.is_empty() {
+        return false;
+    }
+    let rel = to_slash(path.strip_prefix(root).unwrap_or(path));
+    ignores.iter().any(|s| rel.contains(s.as_str()))
+}
+
 /// Invoke `f` for every file listed in every `.hashit` manifest under `root`.
 /// Unreadable/invalid manifests are skipped (their error propagates only if the
 /// directory entry itself can't be read).
-pub fn for_each_entry(root: &Path, mut f: impl FnMut(WalkEntry)) -> Result<()> {
-    for dirent in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+pub fn for_each_entry(root: &Path, f: impl FnMut(WalkEntry)) -> Result<()> {
+    for_each_entry_filtered(root, &[], f)
+}
+
+/// Like [`for_each_entry`], but prunes any directory whose path (relative to
+/// `root`) matches one of the `ignores` substrings, so matching folders and
+/// their whole subtrees are never indexed.
+pub fn for_each_entry_filtered(
+    root: &Path,
+    ignores: &[String],
+    mut f: impl FnMut(WalkEntry),
+) -> Result<()> {
+    let walker = WalkDir::new(root)
+        .into_iter()
+        // Prune ignored directories up front so we never descend into them.
+        .filter_entry(|e| !e.file_type().is_dir() || !is_ignored(e.path(), root, ignores));
+    for dirent in walker.filter_map(|e| e.ok()) {
         if !dirent.file_type().is_file() || dirent.file_name() != MANIFEST_NAME {
             continue;
         }
         let dir = dirent.path().parent().unwrap_or(root);
         let rel_dir = dir.strip_prefix(root).unwrap_or(Path::new(""));
-        let Some(manifest) = Manifest::load(dir)? else {
-            continue;
+        let manifest = match Manifest::load(dir) {
+            Ok(Some(m)) => m,
+            Ok(None) => continue,
+            // A single unreadable/corrupt `.hashit` shouldn't abort the whole
+            // walk: warn and move on so the rest of the tree still indexes.
+            Err(e) => {
+                eprintln!("warning: skipping manifest in {}: {e:#}", dir.display());
+                continue;
+            }
         };
         for (name, entry) in manifest.files {
             let mut rel = rel_dir.to_path_buf();

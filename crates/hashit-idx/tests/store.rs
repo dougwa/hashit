@@ -141,6 +141,71 @@ fn index_and_query() {
 }
 
 #[test]
+fn corrupt_manifest_is_skipped() {
+    let root = unique_dir("bad-root");
+    let meta_folder = unique_dir("bad-meta");
+    let db = unique_dir("bad-db").join("index.db");
+
+    // A good manifest in the root and a corrupt `.hashit` in a subdirectory.
+    let mut files = BTreeMap::new();
+    files.insert("notes.txt".to_string(), entry(10, "deadbeef00112233"));
+    Manifest::new(files).save(&root).unwrap();
+
+    let sub = root.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(sub.join(".hashit"), b"{ not valid json").unwrap();
+
+    let mut s = Store::open(&db).unwrap();
+    // The corrupt manifest must not abort the whole build; the good one indexes.
+    s.rebuild(std::slice::from_ref(&root), &meta_folder).unwrap();
+    assert_eq!(s.stats().unwrap().0, 1);
+
+    // Incrementally re-syncing the corrupt dir is also a no-op, not an error.
+    s.sync_dir(&sub).unwrap();
+    assert_eq!(s.stats().unwrap().0, 1);
+
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&meta_folder).ok();
+    std::fs::remove_dir_all(db.parent().unwrap()).ok();
+}
+
+#[test]
+fn ignored_directories_are_not_indexed() {
+    let root = unique_dir("ign-root");
+    let meta_folder = unique_dir("ign-meta");
+    let db = unique_dir("ign-db").join("index.db");
+
+    // One file in the root, one in a `cache` subdirectory we'll ignore.
+    let mut top = BTreeMap::new();
+    top.insert("notes.txt".to_string(), entry(10, "deadbeef00112233"));
+    Manifest::new(top).save(&root).unwrap();
+
+    let cache = root.join("cache");
+    std::fs::create_dir_all(&cache).unwrap();
+    let mut nested = BTreeMap::new();
+    nested.insert("blob.bin".to_string(), entry(2000, "abcd1234ef567890"));
+    Manifest::new(nested).save(&cache).unwrap();
+
+    let mut s = Store::open(&db).unwrap();
+    s.set_ignores(vec!["cache".to_string()]);
+    s.rebuild(std::slice::from_ref(&root), &meta_folder).unwrap();
+
+    // Only the root file is indexed; the ignored subtree is skipped.
+    assert_eq!(s.stats().unwrap().0, 1);
+    let (rows, _) = s
+        .query(&QueryParams {
+            name: "blob".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(rows.is_empty());
+
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&meta_folder).ok();
+    std::fs::remove_dir_all(db.parent().unwrap()).ok();
+}
+
+#[test]
 fn query_language_end_to_end() {
     let root = unique_dir("ql-root");
     let meta_folder = unique_dir("ql-meta");

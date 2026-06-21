@@ -15,17 +15,20 @@ use notify::{RecursiveMode, Watcher};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult};
 
 use hashit_core::manifest::MANIFEST_NAME;
+use hashit_core::walk;
 
 use crate::store::{hash_from_meta_filename, Store};
 
 /// Watch the roots (for `.hashit`) and the meta folder (for `*.meta.json`),
 /// applying incremental updates to the shared store. Blocks until the channel
-/// closes.
+/// closes. Directories matching one of the `ignores` substrings are skipped, to
+/// match the build-time `--ignore` filtering.
 pub fn run(
     roots: Vec<PathBuf>,
     meta_folder: PathBuf,
     store: Arc<Mutex<Store>>,
     debounce_ms: u64,
+    ignores: Vec<String>,
 ) -> Result<()> {
     let (tx, rx) = mpsc::channel::<DebounceEventResult>();
     let mut debouncer = new_debouncer(Duration::from_millis(debounce_ms), None, move |res| {
@@ -69,7 +72,14 @@ pub fn run(
                     .unwrap_or_default();
                 if name == MANIFEST_NAME {
                     if let Some(parent) = path.parent() {
-                        dirs.insert(parent.to_path_buf());
+                        // Skip dirs under an ignored path, mirroring the build.
+                        let ignored = roots
+                            .iter()
+                            .filter(|r| parent.starts_with(r))
+                            .any(|r| walk::is_ignored(parent, r, &ignores));
+                        if !ignored {
+                            dirs.insert(parent.to_path_buf());
+                        }
                     }
                 } else if let Some(h) = hash_from_meta_filename(&name) {
                     hashes.insert(h.to_string());

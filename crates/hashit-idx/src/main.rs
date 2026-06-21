@@ -66,6 +66,11 @@ struct ServeArgs {
     /// Debounce window in milliseconds for coalescing filesystem events.
     #[arg(long, default_value_t = 500)]
     debounce_ms: u64,
+    /// Substring to ignore anywhere in a path; matching directories (and their
+    /// subtrees) are not indexed or watched. Repeatable; also reads
+    /// `$HASHIT_IGNORE`. Both sources may bundle multiple values with '|'.
+    #[arg(long = "ignore", value_name = "STR")]
+    ignores: Vec<String>,
 }
 
 #[derive(clap::Args)]
@@ -86,6 +91,21 @@ struct QueryArgs {
     /// Print only the matching paths, one per line.
     #[arg(long)]
     paths_only: bool,
+}
+
+/// Merge ignore substrings from `$HASHIT_IGNORE` and the repeatable `--ignore`
+/// flag. Both sources split on '|'; empty segments are dropped (an empty
+/// substring would otherwise match every path). Mirrors `hashit`.
+fn collect_ignores(cli: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Ok(env) = std::env::var("HASHIT_IGNORE") {
+        out.extend(env.split('|').map(str::to_string));
+    }
+    for v in cli {
+        out.extend(v.split('|').map(str::to_string));
+    }
+    out.retain(|s| !s.is_empty());
+    out
 }
 
 /// Default index database location: `$HASHIT_HOME/index.db`, else
@@ -111,8 +131,10 @@ async fn main() -> Result<()> {
 async fn serve(args: ServeArgs) -> Result<()> {
     let meta_folder = resolve_meta_folder(args.meta_folder.clone());
     let db = args.db.clone().unwrap_or_else(default_db);
+    let ignores = collect_ignores(&args.ignores);
 
     let mut store = Store::open(&db)?;
+    store.set_ignores(ignores.clone());
     eprintln!("hashit-idx: building index at {} …", db.display());
     store.rebuild(&args.roots, &meta_folder)?;
     let (files, hashes, tags) = store.stats()?;
@@ -127,8 +149,9 @@ async fn serve(args: ServeArgs) -> Result<()> {
         let roots = args.roots.clone();
         let mf = meta_folder.clone();
         let debounce = args.debounce_ms;
+        let ignores = ignores.clone();
         std::thread::spawn(move || {
-            if let Err(e) = watcher::run(roots, mf, store, debounce) {
+            if let Err(e) = watcher::run(roots, mf, store, debounce, ignores) {
                 eprintln!("hashit-idx: watcher stopped: {e:#}");
             }
         });

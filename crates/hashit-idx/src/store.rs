@@ -47,6 +47,8 @@ pub struct FileRow {
 
 pub struct Store {
     conn: Connection,
+    /// Path substrings whose directories are skipped during (re)indexing.
+    ignores: Vec<String>,
 }
 
 impl Store {
@@ -60,9 +62,17 @@ impl Store {
             .with_context(|| format!("opening {}", db_path.display()))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        let store = Store { conn };
+        let store = Store {
+            conn,
+            ignores: Vec::new(),
+        };
         store.init_schema()?;
         Ok(store)
+    }
+
+    /// Set the `--ignore` path substrings honored when (re)indexing directories.
+    pub fn set_ignores(&mut self, ignores: Vec<String>) {
+        self.ignores = ignores;
     }
 
     fn init_schema(&self) -> Result<()> {
@@ -129,7 +139,7 @@ impl Store {
     /// Insert every file recorded in every `.hashit` under `root`.
     fn reindex_root(&mut self, root: &Path) -> Result<()> {
         let mut rows: Vec<(String, String, String, String, String, i64, i64)> = Vec::new();
-        walk::for_each_entry(root, |e| {
+        walk::for_each_entry_filtered(root, &self.ignores, |e| {
             let dir = e
                 .path
                 .parent()
@@ -187,7 +197,15 @@ impl Store {
     /// (handles create/modify/remove of the manifest).
     pub fn sync_dir(&mut self, dir: &Path) -> Result<()> {
         let dir_str = dir.to_string_lossy().to_string();
-        let manifest = Manifest::load(dir)?;
+        // A corrupt/unreadable `.hashit` shouldn't error or wipe the dir's rows:
+        // keep the last-known-good index until the manifest parses again.
+        let manifest = match Manifest::load(dir) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("warning: skipping manifest in {}: {e:#}", dir.display());
+                return Ok(());
+            }
+        };
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM files WHERE dir = ?1", params![dir_str])?;
         if let Some(m) = manifest {
