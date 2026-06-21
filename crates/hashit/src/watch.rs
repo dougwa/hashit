@@ -103,6 +103,11 @@ pub fn watch(
                     if !d.is_dir() {
                         continue;
                     }
+                    // Honor --exclude/--ignore on live events too, matching the
+                    // initial scan which prunes these subtrees.
+                    if opts.is_skipped(&d, root) {
+                        continue;
+                    }
                     match process_dir(&d, opts, root) {
                         Ok((s, changed)) => {
                             if changed && !opts.quiet {

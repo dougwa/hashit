@@ -382,7 +382,7 @@ fn run(cli: Cli) -> Result<()> {
             // dry run (nothing was persisted to derive artifacts from).
             if !a.dry_run {
                 if let Some(mopts) = a.meta.to_options() {
-                    meta_pass::run(&a.common.roots, &mopts, opts.quiet)?;
+                    meta_pass::run(&a.common.roots, &mopts, &opts.ignores, opts.quiet)?;
                 }
             }
             Ok(())
@@ -394,7 +394,7 @@ fn run(cli: Cli) -> Result<()> {
             // Seed metadata for the initial scan state, then keep it fresh as
             // each changed directory is reconciled.
             if let Some(m) = &mopts {
-                meta_pass::run(&a.common.roots, m, opts.quiet)?;
+                meta_pass::run(&a.common.roots, m, &opts.ignores, opts.quiet)?;
             }
             if let Some(addr) = a.serve {
                 let meta_folder = meta::resolve_meta_folder(a.meta.meta_folder.clone());

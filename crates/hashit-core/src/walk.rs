@@ -92,3 +92,54 @@ pub fn for_each_entry_filtered(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::manifest::FileEntry;
+    use std::collections::BTreeMap;
+
+    fn entry() -> FileEntry {
+        FileEntry {
+            size: 1,
+            mtime_ns: 0,
+            hash: "h".into(),
+            algo: "blake3".into(),
+            flags: vec![],
+            hashed_at: String::new(),
+        }
+    }
+
+    fn save_manifest(dir: &Path, file: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        let mut files = BTreeMap::new();
+        files.insert(file.to_string(), entry());
+        Manifest::new(files).save(dir).unwrap();
+    }
+
+    #[test]
+    fn filtered_walk_prunes_ignored_subtrees() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("hashit-walk-{}-{nanos}", std::process::id()));
+        save_manifest(&root, "keep.txt");
+        save_manifest(&root.join("var/store/.filegear/75"), "blob.bin");
+
+        let collect = |ignores: &[String]| {
+            let mut names: Vec<String> = Vec::new();
+            for_each_entry_filtered(&root, ignores, |e| names.push(e.rel)).unwrap();
+            names.sort();
+            names
+        };
+
+        // No ignores: both files are visited.
+        assert_eq!(collect(&[]), vec!["keep.txt", "var/store/.filegear/75/blob.bin"]);
+
+        // Ignoring `.filegear` prunes the whole subtree, leaving only keep.txt.
+        assert_eq!(collect(&[".filegear".to_string()]), vec!["keep.txt"]);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+}

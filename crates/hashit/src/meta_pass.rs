@@ -48,11 +48,13 @@ struct Rep {
     algo: String,
 }
 
-/// First on-disk copy seen for each unique hash across all roots.
-fn representatives(roots: &[PathBuf]) -> Result<HashMap<String, Rep>> {
+/// First on-disk copy seen for each unique hash across all roots. Directories
+/// matching one of the `ignores` substrings are pruned, mirroring `scan`'s
+/// `--ignore` so the meta pass never reaches inside an ignored subtree.
+fn representatives(roots: &[PathBuf], ignores: &[String]) -> Result<HashMap<String, Rep>> {
     let mut reps: HashMap<String, Rep> = HashMap::new();
     for root in roots {
-        walk::for_each_entry(root, |e| {
+        walk::for_each_entry_filtered(root, ignores, |e| {
             reps.entry(e.entry.hash.clone()).or_insert_with(|| Rep {
                 path: e.path,
                 size: e.entry.size,
@@ -119,8 +121,15 @@ fn ensure(hash: &str, rep: &Rep, opts: &MetaOptions) -> (bool, bool, bool) {
 }
 
 /// Bulk pass over every unique hash under `roots` (parallel across hashes).
-pub fn run(roots: &[PathBuf], opts: &MetaOptions, quiet: bool) -> Result<MetaStats> {
-    let reps = representatives(roots)?;
+/// `ignores` are the `--ignore` substrings, applied so ignored subtrees are
+/// skipped just as `scan` skips them.
+pub fn run(
+    roots: &[PathBuf],
+    opts: &MetaOptions,
+    ignores: &[String],
+    quiet: bool,
+) -> Result<MetaStats> {
+    let reps = representatives(roots, ignores)?;
     let results: Vec<(bool, bool, bool)> =
         reps.par_iter().map(|(h, rep)| ensure(h, rep, opts)).collect();
     let mut stats = MetaStats {
@@ -139,9 +148,16 @@ pub fn run(roots: &[PathBuf], opts: &MetaOptions, quiet: bool) -> Result<MetaSta
 }
 
 /// Watch hook: regenerate artifacts for the files in one directory's manifest.
+/// A corrupt/unreadable manifest is skipped (not fatal): `scan` regenerates it,
+/// and the resulting write fires another event that re-runs this hook.
 pub fn run_for_dir(dir: &Path, opts: &MetaOptions) -> Result<()> {
-    let Some(manifest) = Manifest::load(dir)? else {
-        return Ok(());
+    let manifest = match Manifest::load(dir) {
+        Ok(Some(m)) => m,
+        Ok(None) => return Ok(()),
+        Err(e) => {
+            eprintln!("warning: skipping manifest in {}: {e:#}", dir.display());
+            return Ok(());
+        }
     };
     let mut seen: HashSet<String> = HashSet::new();
     for (name, entry) in manifest.files {
